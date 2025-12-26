@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -3244,12 +3245,16 @@ func (s *Versioning3Suite) doPollWftAndHandle(
 	}
 	if async == nil {
 		return poller, f()
-	} else {
-		go func() {
-			f()
-			close(async)
-		}()
 	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	s.T().Cleanup(wg.Wait)
+	go func() {
+		defer wg.Done()
+		f()
+		close(async)
+	}()
 	return nil, nil
 }
 
@@ -3277,7 +3282,11 @@ func (s *Versioning3Suite) pollWftAndHandleQueries(
 	if async == nil {
 		return poller, f()
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	s.T().Cleanup(wg.Wait)
 	go func() {
+		defer wg.Done()
 		f()
 		close(async)
 	}()
@@ -3308,7 +3317,11 @@ func (s *Versioning3Suite) pollNexusTaskAndHandle(
 	if async == nil {
 		return poller, f()
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	s.T().Cleanup(wg.Wait)
 	go func() {
+		defer wg.Done()
 		f()
 		close(async)
 	}()
@@ -3349,7 +3362,11 @@ func (s *Versioning3Suite) doPollActivityAndHandle(
 	if async == nil {
 		f()
 	} else {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		s.T().Cleanup(wg.Wait)
 		go func() {
+			defer wg.Done()
 			f()
 			close(async)
 		}()

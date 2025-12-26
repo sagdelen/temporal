@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1869,10 +1870,16 @@ func (s *WorkerDeploymentSuite) TestConcurrentPollers_DifferentTaskQueues_SameVe
 	// start 10 different pollers each polling on a different task queue but belonging to the same version
 	tv := testvars.New(s)
 
+	var wg sync.WaitGroup
 	versions := 10
+	wg.Add(versions)
 	for i := 0; i < versions; i++ {
-		go s.startVersionWorkflow(ctx, tv.WithTaskQueueNumber(i))
+		go func(i int) {
+			defer wg.Done()
+			s.startVersionWorkflow(ctx, tv.WithTaskQueueNumber(i))
+		}(i)
 	}
+	defer wg.Wait()
 
 	// set this version as current version
 	s.setCurrentVersion(ctx, tv, false, "")

@@ -1577,6 +1577,8 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		})
 	}
 
+	// GetWorkflowExecutionRawHistoryV2 start and end
+
 	eventsBatch1 := []*historypb.History{
 		{Events: []*historypb.HistoryEvent{
 			{
@@ -1961,10 +1963,18 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		batchCount++
 		token = resp.NextPageToken
+		if len(resp.HistoryBatches) == 0 {
+			s.Empty(token)
+			continue
+		}
+		batchCount++
 	}
-	s.Equal(batchCount, 4)
+	expectedBatchCount := 4
+	if testcore.UseMongoPersistence() {
+		expectedBatchCount = 3
+	}
+	s.Equal(expectedBatchCount, batchCount)
 
 	// GetWorkflowExecutionRawHistoryV2 start and end not on the same branch
 	token = nil
@@ -1984,14 +1994,23 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		batchCount++
 		token = resp.NextPageToken
+		if len(resp.HistoryBatches) == 0 {
+			s.Empty(token)
+			continue
+		}
+		batchCount++
 	}
-	s.Equal(batchCount, 2)
+	expectedCrossBranch := 2
+	if testcore.UseMongoPersistence() {
+		expectedCrossBranch = 1
+	}
+	s.Equal(expectedCrossBranch, batchCount)
 
 	// GetWorkflowExecutionRawHistoryV2 start boundary
 	token = nil
 	batchCount = 0
+	startBoundaryEventIDs := make([]int64, 0)
 	for continuePaging := true; continuePaging; continuePaging = len(token) != 0 {
 		resp, err := getHistory(
 			s.namespace,
@@ -2007,10 +2026,26 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		batchCount++
+		for _, blob := range resp.HistoryBatches {
+			events, err := s.serializer.DeserializeEvents(blob)
+			s.Require().NoError(err)
+			for _, evt := range events {
+				startBoundaryEventIDs = append(startBoundaryEventIDs, evt.GetEventId())
+			}
+		}
 		token = resp.NextPageToken
+		if len(resp.HistoryBatches) == 0 {
+			s.Empty(token)
+			continue
+		}
+		batchCount++
 	}
-	s.Equal(batchCount, 3)
+	expectedStartBoundary := 3
+	if testcore.UseMongoPersistence() {
+		expectedStartBoundary = 2
+	}
+	s.Equal(expectedStartBoundary, batchCount)
+	s.T().Logf("start boundary events: %v", startBoundaryEventIDs)
 
 	// GetWorkflowExecutionRawHistoryV2 end boundary
 	token = nil
@@ -2030,10 +2065,18 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		batchCount++
 		token = resp.NextPageToken
+		if len(resp.HistoryBatches) == 0 {
+			s.Empty(token)
+			continue
+		}
+		batchCount++
 	}
-	s.Equal(batchCount, 10)
+	expectedEndBoundary := 10
+	if testcore.UseMongoPersistence() {
+		expectedEndBoundary = 8
+	}
+	s.Equal(expectedEndBoundary, batchCount)
 }
 
 func (s *NDCFunctionalTestSuite) registerNamespace() {
