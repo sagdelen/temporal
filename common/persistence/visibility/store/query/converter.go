@@ -79,6 +79,7 @@ type (
 var (
 	groupByFieldAllowlist = []string{
 		sadefs.ExecutionStatus,
+		"PayloadExecutionStatus",
 	}
 
 	groupByFieldPrefixAllowlist = []string{

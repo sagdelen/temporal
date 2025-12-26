@@ -44,3 +44,6 @@
 
 **/.venv/
 **/.ruff_cache/
+
+# MongoDB development workspace
+.mongodb-dev/
