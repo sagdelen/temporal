@@ -793,33 +793,51 @@ func historyNodeFilter(
 		"branch_id": branchID,
 	}
 
-	idCond := bson.M{}
 	if req.ReverseOrder {
+		idCond := bson.M{}
 		if token.LastNodeID != 0 {
 			idCond["$lt"] = historyNodeDocID(treeID, branchID, token.LastNodeID, token.LastTxnID)
 		} else if req.MaxNodeID != 0 {
 			idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
 		}
+		if req.MinNodeID != 0 {
+			idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
+		}
+		if len(idCond) > 0 {
+			filter["_id"] = idCond
+		}
 	} else {
+		// Forward order: NodeID ASC, TxnID DESC
+		// SQL uses: ((node_id = ? AND txn_id > ?) OR node_id > ?) AND node_id < ?
+		// Since MongoDB stores TxnID normally (not negated like SQL), we use TxnID < for same NodeID.
 		if token.LastNodeID != 0 {
-			// Forward order: NodeID ASC, TxnID DESC
-			// We cannot use _id range query for pagination because _id sort order (NodeID ASC, TxnID ASC)
-			// does not match the required sort order.
-			// We use field-based pagination:
-			// (NodeID > LastNodeID) OR (NodeID == LastNodeID && TxnID < LastTxnID)
-			filter["$or"] = []bson.M{
+			// Pagination with token: get records after the last one
+			// Use $and to combine $or pagination with MaxNodeID constraint
+			orCond := []bson.M{
 				{"node_id": bson.M{"$gt": token.LastNodeID}},
 				{"node_id": token.LastNodeID, "txn_id": bson.M{"$lt": token.LastTxnID}},
 			}
-		} else if req.MinNodeID != 0 {
-			idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, token.LastTxnID)
+			if req.MaxNodeID != 0 {
+				filter["$and"] = []bson.M{
+					{"$or": orCond},
+					{"node_id": bson.M{"$lt": req.MaxNodeID}},
+				}
+			} else {
+				filter["$or"] = orCond
+			}
+		} else {
+			// No token: use _id range query
+			idCond := bson.M{}
+			if req.MinNodeID != 0 {
+				idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
+			}
+			if req.MaxNodeID != 0 {
+				idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
+			}
+			if len(idCond) > 0 {
+				filter["_id"] = idCond
+			}
 		}
-		if req.MaxNodeID != 0 {
-			idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-		}
-	}
-	if len(idCond) > 0 {
-		filter["_id"] = idCond
 	}
 	return filter
 }

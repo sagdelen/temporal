@@ -1970,11 +1970,7 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		}
 		batchCount++
 	}
-	expectedBatchCount := 4
-	if testcore.UseMongoPersistence() {
-		expectedBatchCount = 3
-	}
-	s.Equal(expectedBatchCount, batchCount)
+	s.Equal(4, batchCount)
 
 	// GetWorkflowExecutionRawHistoryV2 start and end not on the same branch
 	token = nil
@@ -2001,11 +1997,7 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		}
 		batchCount++
 	}
-	expectedCrossBranch := 2
-	if testcore.UseMongoPersistence() {
-		expectedCrossBranch = 1
-	}
-	s.Equal(expectedCrossBranch, batchCount)
+	s.Equal(2, batchCount)
 
 	// GetWorkflowExecutionRawHistoryV2 start boundary
 	token = nil
@@ -2040,11 +2032,7 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		}
 		batchCount++
 	}
-	expectedStartBoundary := 3
-	if testcore.UseMongoPersistence() {
-		expectedStartBoundary = 2
-	}
-	s.Equal(expectedStartBoundary, batchCount)
+	s.Equal(3, batchCount)
 	s.T().Logf("start boundary events: %v", startBoundaryEventIDs)
 
 	// GetWorkflowExecutionRawHistoryV2 end boundary
@@ -2072,11 +2060,7 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		}
 		batchCount++
 	}
-	expectedEndBoundary := 10
-	if testcore.UseMongoPersistence() {
-		expectedEndBoundary = 8
-	}
-	s.Equal(expectedEndBoundary, batchCount)
+	s.Equal(10, batchCount)
 }
 
 func (s *NDCFunctionalTestSuite) registerNamespace() {
