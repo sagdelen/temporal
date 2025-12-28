@@ -1,4 +1,4 @@
-package visibility_test
+package visibility
 
 import (
 	"context"
@@ -11,15 +11,10 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
-	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
-	visibilitypkg "go.temporal.io/server/common/persistence/visibility"
 	"go.temporal.io/server/common/persistence/visibility/manager"
-	"go.temporal.io/server/service/history/configs"
-	historyi "go.temporal.io/server/service/history/interfaces"
-	"go.temporal.io/server/service/history/tests"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/proto"
 )
@@ -32,9 +27,7 @@ type (
 
 		registry          *chasm.Registry
 		visibilityManager *manager.MockVisibilityManager
-		shardContext      *historyi.MockShardContext
-		config            *configs.Config
-		visibilityMgr     *visibilitypkg.ChasmVisibilityManager
+		visibilityMgr     *ChasmVisibilityManager
 	}
 
 	// Test component for mocking CHASM components in visibility tests
@@ -98,13 +91,8 @@ func (s *ChasmVisibilityManagerSuite) SetupTest() {
 	s.NoError(err)
 
 	s.visibilityManager = manager.NewMockVisibilityManager(s.controller)
-	s.shardContext = historyi.NewMockShardContext(s.controller)
-	s.shardContext.EXPECT().ChasmRegistry().Return(s.registry).AnyTimes()
 
-	s.config = tests.NewDynamicConfig()
-	s.config.HistoryMaxPageSize = dynamicconfig.GetIntPropertyFnFilteredByNamespace(1000)
-
-	s.visibilityMgr = visibilitypkg.NewChasmVisibilityManager(
+	s.visibilityMgr = NewChasmVisibilityManager(
 		s.registry,
 		s.visibilityManager,
 	)

@@ -108,8 +108,7 @@ func (s *RpoSuite) TestScheduledUpdates() {
 	serviceName := primitives.MatchingService
 	// note these are only accurate to the start of the second, so they're effectively rounded
 	// down if we start mid-second.
-	const scheduleLeadTime = 5 * time.Second
-	start := time.Now().Add(scheduleLeadTime)
+	start := time.Now()
 	joinTimes := []time.Time{
 		start.Add(2 * time.Second),
 		time.Time{},

@@ -429,9 +429,6 @@ type (
 		// EXPERIMENTAL - TaskScanPartitions is the number of partitions to sequentially scan during ListTaskQueue operations.
 		// This is used for in a sharded sql database such as Vitess for heavy task workloads to minimize scatter gather.
 		// The default value for this param is 1, and should not be configured without a thorough understanding of what this does.
-		// TaskScanPartitions is the number of partitions to sequentially scan during ListTaskQueue operations.
-		// This is used for in a sharded sql database such as Vitess for heavy task workloads to minimize scatter gather.
-		// The default value for this param is 1, and should not be configured without a thorough understanding of what this does.
 		TaskScanPartitions int `yaml:"taskScanPartitions"`
 		// TLS is the configuration for TLS connections
 		TLS *auth.TLS `yaml:"tls"`
