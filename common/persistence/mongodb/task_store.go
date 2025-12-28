@@ -260,6 +260,10 @@ func (s *taskStore) GetTaskQueue(
 		return nil, serviceerror.NewUnavailablef("GetTaskQueue failed: %v", err)
 	}
 
+	if doc.RangeID == 0 {
+		return nil, serviceerror.NewNotFoundf("task queue %s not found (rangeID=0)", request.TaskQueue)
+	}
+
 	return &persistence.InternalGetTaskQueueResponse{
 		RangeID:       doc.RangeID,
 		TaskQueueInfo: persistence.NewDataBlob(doc.Data, doc.Encoding),

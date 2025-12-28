@@ -203,7 +203,7 @@ func TestVisibilityStoreListWorkflowExecutions_WithQuery(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, andExpr, 2)
 	require.Equal(t, "ns", andExpr[0]["namespace_id"])
-	require.Equal(t, "wf1", andExpr[1]["workflow_id"])
+	require.True(t, filterContains(andExpr[1], "workflow_id", "wf1"))
 }
 
 func TestVisibilityStoreListWorkflowExecutions_WithStatusQuery(t *testing.T) {
@@ -221,7 +221,7 @@ func TestVisibilityStoreListWorkflowExecutions_WithStatusQuery(t *testing.T) {
 	andExpr := filter["$and"].([]bson.M)
 	require.Len(t, andExpr, 2)
 	statusClause := andExpr[1]
-	require.Equal(t, int32(enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED), statusClause["status"])
+	require.True(t, filterContains(statusClause, "status", int32(enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED)))
 }
 
 func TestVisibilityStoreListChasmExecutions(t *testing.T) {
@@ -262,7 +262,7 @@ func TestVisibilityStoreListChasmExecutions(t *testing.T) {
 	filter := col.findFilters[0].(bson.M)
 	fieldName, fieldErr := component.SearchAttributesMapper().Field("status")
 	require.NoError(t, fieldErr)
-	require.True(t, filterContains(filter, fieldName, "READY"))
+	require.True(t, filterContains(filter, "search_attributes."+fieldName, "READY"))
 }
 
 func TestVisibilityStoreListChasmExecutionsUnknownArchetype(t *testing.T) {
@@ -304,7 +304,7 @@ func TestVisibilityStoreCountChasmExecutions(t *testing.T) {
 	filter := col.countFilters[0].(bson.M)
 	fieldName, fieldErr := component.SearchAttributesMapper().Field("status")
 	require.NoError(t, fieldErr)
-	require.True(t, filterContains(filter, fieldName, "READY"))
+	require.True(t, filterContains(filter, "search_attributes."+fieldName, "READY"))
 }
 
 func TestVisibilityStoreGetWorkflowExecution(t *testing.T) {
@@ -388,7 +388,7 @@ func TestVisibilityStoreCountWorkflowExecutions_WithQuery(t *testing.T) {
 	filter := col.countFilters[0].(bson.M)
 	andExpr := filter["$and"].([]bson.M)
 	require.Len(t, andExpr, 2)
-	require.Equal(t, "wf1", andExpr[1]["workflow_id"])
+	require.True(t, filterContains(andExpr[1], "workflow_id", "wf1"))
 }
 
 func TestVisibilityStoreCountWorkflowExecutions_GroupBy(t *testing.T) {

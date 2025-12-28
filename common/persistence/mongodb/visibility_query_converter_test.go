@@ -31,7 +31,7 @@ func TestMongoQueryConverterKeywordListNotStartsWith(t *testing.T) {
 	filter, err := converter.ConvertKeywordListComparisonExpr(sqlparser.NotStartsWithStr, col, "property:activityType=")
 	require.NoError(t, err)
 
-	clause, ok := filter[sadefs.TemporalPauseInfo].(bson.M)
+	clause, ok := filter["search_attributes."+sadefs.TemporalPauseInfo].(bson.M)
 	require.True(t, ok)
 
 	regex, ok := clause["$not"].(primitive.Regex)
