@@ -381,13 +381,8 @@ func (f *Factory) NewVisibilityStore(
 	logger log.Logger,
 	_ metrics.Handler,
 ) (store.VisibilityStore, error) {
-	f.Lock()
-	defer f.Unlock()
-
-	if f.visibilityStore != nil {
-		return f.visibilityStore, nil
-	}
-
+	// Do not cache visibility store because different services have different chasm registries
+	// and caching would use the registry from the first service that calls this method.
 	_ = cfg
 
 	visStore, err := NewVisibilityStore(
@@ -405,7 +400,6 @@ func (f *Factory) NewVisibilityStore(
 		return nil, err
 	}
 
-	f.visibilityStore = visStore
 	return visStore, nil
 }
 

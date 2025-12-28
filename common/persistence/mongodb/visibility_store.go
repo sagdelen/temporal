@@ -947,6 +947,10 @@ func (s *visibilityStore) buildQueryFilter(
 ) (bson.M, error) {
 	params, err := s.convertQueryParams(ctx, nsID, nsName, queryString, chasmMapper, archetypeID)
 	if err != nil {
+		var converterErr *query.ConverterError
+		if errors.As(err, &converterErr) {
+			return nil, converterErr.ToInvalidArgument()
+		}
 		return nil, err
 	}
 	if params == nil {
