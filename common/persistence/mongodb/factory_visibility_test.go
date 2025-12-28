@@ -68,18 +68,30 @@ func TestFactoryNewVisibilityStore(t *testing.T) {
 	require.Equal(t, saMapperProvider, impl.searchAttributesMapperProvider)
 	require.Equal(t, chasmRegistry, impl.chasmRegistry)
 
-	cached, err := factory.NewVisibilityStore(
+	// Visibility store is NOT cached because different services have different chasm registries.
+	// Each call should return a new instance with the provided parameters.
+	chasmRegistry2 := chasm.NewRegistry(logger)
+	saProvider2 := &stubSAPProvider{}
+	saMapperProvider2 := &stubMapperProvider{}
+
+	visStore2, err := factory.NewVisibilityStore(
 		config.CustomDatastoreConfig{},
+		saProvider2,
+		saMapperProvider2,
 		nil,
-		nil,
-		nil,
-		chasmRegistry,
+		chasmRegistry2,
 		nil,
 		logger,
 		metrics.NoopMetricsHandler,
 	)
 	require.NoError(t, err)
-	require.Same(t, visStore, cached)
+	require.NotSame(t, visStore, visStore2)
+
+	impl2, ok := visStore2.(*visibilityStore)
+	require.True(t, ok)
+	require.Equal(t, saProvider2, impl2.searchAttributesProvider)
+	require.Equal(t, saMapperProvider2, impl2.searchAttributesMapperProvider)
+	require.Equal(t, chasmRegistry2, impl2.chasmRegistry)
 
 	require.NotNil(t, executionsCol.indexView)
 	require.NotNil(t, searchAttrCol.indexView)
