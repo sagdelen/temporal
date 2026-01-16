@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -17,6 +17,7 @@ import (
 	otelsdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	"go.opentelemetry.io/otel/trace"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
@@ -43,6 +44,7 @@ import (
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/resource"
 	"go.temporal.io/server/common/rpc/encryption"
+	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/service/frontend"
@@ -99,9 +101,10 @@ type (
 		ServiceNames    resource.ServiceNames
 		NamespaceLogger resource.NamespaceLogger
 
-		ServiceResolver        resolver.ServiceResolver
-		CustomDataStoreFactory persistenceClient.AbstractDataStoreFactory
-		CustomVisibilityStore  visibility.VisibilityStoreFactory
+		ServiceResolver               resolver.ServiceResolver
+		CustomDataStoreFactory        persistenceClient.AbstractDataStoreFactory
+		CustomVisibilityStore         visibility.VisibilityStoreFactory
+		CustomVisibilityStoreForGraph visibility.VisibilityStoreFactory `name:"customVisibilityStore" optional:"true"`
 
 		SearchAttributesMapper     searchattribute.Mapper
 		CustomFrontendInterceptors []grpc.UnaryServerInterceptor
@@ -120,6 +123,13 @@ type (
 	}
 )
 
+type visibilityStoreFactoryOut struct {
+	fx.Out
+
+	Default  visibility.VisibilityStoreFactory `name:"defaultVisibilityStore" optional:"true"`
+	Fallback visibility.VisibilityStoreFactory `name:"customVisibilityStoreFallback" optional:"true"`
+}
+
 var (
 	TopLevelModule = fx.Options(
 		fx.Provide(
@@ -127,6 +137,7 @@ var (
 			ServerOptionsProvider,
 			resource.ArchivalMetadataProvider,
 			TaskCategoryRegistryProvider,
+			visibilityStoreFactoryProvider,
 			PersistenceFactoryProvider,
 			HistoryServiceProvider,
 			MatchingServiceProvider,
@@ -135,12 +146,30 @@ var (
 			WorkerServiceProvider,
 			ApplyClusterMetadataConfigProvider,
 		),
+		fx.Decorate(
+			fx.Annotate(
+				func(
+					custom visibility.VisibilityStoreFactory,
+					fallback visibility.VisibilityStoreFactory,
+				) visibility.VisibilityStoreFactory {
+					if custom != nil {
+						return custom
+					}
+					return fallback
+				},
+				fx.ParamTags(`name:"customVisibilityStore" optional:"true"`, `name:"customVisibilityStoreFallback" optional:"true"`),
+				fx.ResultTags(`name:"customVisibilityStore"`),
+			),
+		),
 		dynamicconfig.Module,
 		pprof.Module,
 		TraceExportModule,
-		chasm.Module,
 		FxLogAdapter,
 		fx.Invoke(ServerLifetimeHooks),
+	)
+
+	ChasmLibraryOptions = fx.Options(
+		chasm.Module,
 	)
 )
 
@@ -275,9 +304,10 @@ func ServerOptionsProvider(opts []ServerOption) (serverOptionsProvider, error) {
 		ServiceHosts:    so.hostsByService,
 		NamespaceLogger: so.namespaceLogger,
 
-		ServiceResolver:        so.persistenceServiceResolver,
-		CustomDataStoreFactory: so.customDataStoreFactory,
-		CustomVisibilityStore:  so.customVisibilityStoreFactory,
+		ServiceResolver:               so.persistenceServiceResolver,
+		CustomDataStoreFactory:        so.customDataStoreFactory,
+		CustomVisibilityStore:         so.customVisibilityStoreFactory,
+		CustomVisibilityStoreForGraph: so.customVisibilityStoreFactory,
 
 		SearchAttributesMapper:     so.searchAttributesMapper,
 		CustomFrontendInterceptors: so.customFrontendInterceptors,
@@ -330,31 +360,31 @@ type (
 	ServiceProviderParamsCommon struct {
 		fx.In
 
-		Cfg                        *config.Config
-		ServiceNames               resource.ServiceNames
-		Logger                     log.Logger
-		NamespaceLogger            resource.NamespaceLogger
-		DynamicConfigClient        dynamicconfig.Client
-		MetricsHandler             metrics.Handler
-		EsClient                   esclient.Client
-		TlsConfigProvider          encryption.TLSConfigProvider
-		PersistenceConfig          config.Persistence
-		ClusterMetadata            *cluster.Config
-		ClientFactoryProvider      client.FactoryProvider
-		AudienceGetter             authorization.JWTAudienceMapper
-		PersistenceServiceResolver resolver.ServiceResolver
-		PersistenceFactoryProvider persistenceClient.FactoryProviderFn
-		SearchAttributesMapper     searchattribute.Mapper
-		CustomFrontendInterceptors []grpc.UnaryServerInterceptor
-		Authorizer                 authorization.Authorizer
-		ClaimMapper                authorization.ClaimMapper
-		DataStoreFactory           persistenceClient.AbstractDataStoreFactory
-		VisibilityStoreFactory     visibility.VisibilityStoreFactory
-		SpanExporters              []otelsdktrace.SpanExporter
-		InstanceID                 resource.InstanceID                     `optional:"true"`
-		StaticServiceHosts         map[primitives.ServiceName]static.Hosts `optional:"true"`
-		TaskCategoryRegistry       tasks.TaskCategoryRegistry
-		ChasmRegistry              *chasm.Registry
+		Cfg                           *config.Config
+		ServiceNames                  resource.ServiceNames
+		Logger                        log.Logger
+		NamespaceLogger               resource.NamespaceLogger
+		DynamicConfigClient           dynamicconfig.Client
+		MetricsHandler                metrics.Handler
+		EsClient                      esclient.Client
+		TLSConfigProvider             encryption.TLSConfigProvider
+		PersistenceConfig             config.Persistence
+		ClusterMetadata               *cluster.Config
+		ClientFactoryProvider         client.FactoryProvider
+		AudienceGetter                authorization.JWTAudienceMapper
+		PersistenceServiceResolver    resolver.ServiceResolver
+		PersistenceFactoryProvider    persistenceClient.FactoryProviderFn
+		SearchAttributesMapper        searchattribute.Mapper
+		CustomFrontendInterceptors    []grpc.UnaryServerInterceptor
+		Authorizer                    authorization.Authorizer
+		ClaimMapper                   authorization.ClaimMapper
+		DataStoreFactory              persistenceClient.AbstractDataStoreFactory
+		VisibilityStoreFactory        visibility.VisibilityStoreFactory `name:"customVisibilityStore" optional:"true"`
+		DefaultVisibilityStoreFactory visibility.VisibilityStoreFactory `name:"defaultVisibilityStore" optional:"true"`
+		SpanExporters                 []otelsdktrace.SpanExporter
+		InstanceID                    resource.InstanceID                     `optional:"true"`
+		StaticServiceHosts            map[primitives.ServiceName]static.Hosts `optional:"true"`
+		TaskCategoryRegistry          tasks.TaskCategoryRegistry
 	}
 )
 
@@ -386,7 +416,10 @@ func (params ServiceProviderParamsCommon) GetCommonServiceOptions(serviceName pr
 				return params.DataStoreFactory
 			},
 			func() visibility.VisibilityStoreFactory {
-				return params.VisibilityStoreFactory
+				if params.VisibilityStoreFactory != nil {
+					return params.VisibilityStoreFactory
+				}
+				return params.DefaultVisibilityStoreFactory
 			},
 			func() client.FactoryProvider {
 				return params.ClientFactoryProvider
@@ -407,7 +440,7 @@ func (params ServiceProviderParamsCommon) GetCommonServiceOptions(serviceName pr
 				return params.ClaimMapper
 			},
 			func() encryption.TLSConfigProvider {
-				return params.TlsConfigProvider
+				return params.TLSConfigProvider
 			},
 			func() dynamicconfig.Client {
 				return params.DynamicConfigClient
@@ -427,14 +460,12 @@ func (params ServiceProviderParamsCommon) GetCommonServiceOptions(serviceName pr
 			func() tasks.TaskCategoryRegistry {
 				return params.TaskCategoryRegistry
 			},
-			func() *chasm.Registry {
-				return params.ChasmRegistry
-			},
 		),
 		ServiceTracingModule,
 		resource.DefaultOptions,
 		membershipModule,
 		FxLogAdapter,
+		ChasmLibraryOptions,
 	)
 }
 
@@ -451,6 +482,19 @@ func TaskCategoryRegistryProvider(archivalMetadata archiver.ArchivalMetadata) ta
 		registry.AddCategory(tasks.CategoryArchival)
 	}
 	return registry
+}
+
+func visibilityStoreFactoryProvider(
+	dataStoreFactory persistence.DataStoreFactory,
+) visibilityStoreFactoryOut {
+	factory, ok := dataStoreFactory.(visibility.VisibilityStoreFactory)
+	if !ok || factory == nil {
+		return visibilityStoreFactoryOut{}
+	}
+	return visibilityStoreFactoryOut{
+		Default:  factory,
+		Fallback: factory,
+	}
 }
 
 func NewService(app *fx.App, serviceName primitives.ServiceName, logger log.Logger) ServicesGroupOut {
@@ -525,6 +569,7 @@ func genericFrontendServiceProvider(
 	app := fx.New(
 		params.GetCommonServiceOptions(serviceName),
 		fx.Supply(params.CustomFrontendInterceptors),
+		fx.Supply([]grpc.StreamServerInterceptor{}),
 		fx.Decorate(func() authorization.ClaimMapper {
 			switch serviceName {
 			case primitives.FrontendService:
@@ -578,6 +623,7 @@ func ApplyClusterMetadataConfigProvider(
 	persistenceServiceResolver resolver.ServiceResolver,
 	persistenceFactoryProvider persistenceClient.FactoryProviderFn,
 	customDataStoreFactory persistenceClient.AbstractDataStoreFactory,
+	customVisibilityStoreFactory visibility.VisibilityStoreFactory,
 	metricsHandler metrics.Handler,
 ) (*cluster.Config, config.Persistence, error) {
 	ctx := context.TODO()
@@ -610,12 +656,34 @@ func ApplyClusterMetadataConfigProvider(
 	}
 	defer clusterMetadataManager.Close()
 
-	initialIndexSearchAttributes := make(map[string]*persistencespb.IndexSearchAttributes)
-	if ds := svc.Persistence.GetVisibilityStoreConfig(); ds.SQL != nil {
-		initialIndexSearchAttributes[ds.GetIndexName()] = searchattribute.GetSqlDbIndexSearchAttributes()
+	visCSAOverride := map[enumspb.IndexedValueType]int{}
+	for tpName, value := range svc.Visibility.PersistenceCustomSearchAttributes {
+		saType, ok := enumspb.IndexedValueType_shorthandValue[tpName]
+		if !ok {
+			return svc.ClusterMetadata,
+				svc.Persistence,
+				fmt.Errorf("invalid search attribute type: %s", tpName)
+		}
+		if value < 0 || value > 99 {
+			return svc.ClusterMetadata,
+				svc.Persistence,
+				fmt.Errorf(
+					"invalid number of custom search attributes for type %s (must be between 0 and 99)",
+					tpName,
+				)
+		}
+		visCSAOverride[enumspb.IndexedValueType(saType)] = value
 	}
-	if ds := svc.Persistence.GetSecondaryVisibilityStoreConfig(); ds.SQL != nil {
-		initialIndexSearchAttributes[ds.GetIndexName()] = searchattribute.GetSqlDbIndexSearchAttributes()
+
+	visDataStores := []config.DataStore{
+		svc.Persistence.GetVisibilityStoreConfig(),
+		svc.Persistence.GetSecondaryVisibilityStoreConfig(),
+	}
+	indexSearchAttributes := make(map[string]*persistencespb.IndexSearchAttributes)
+	for _, ds := range visDataStores {
+		if ds.SQL != nil || ds.CustomDataStoreConfig != nil || ds.MongoDB != nil {
+			indexSearchAttributes[ds.GetIndexName()] = searchattribute.GetSqlDbIndexSearchAttributes()
+		}
 	}
 
 	clusterMetadata := svc.ClusterMetadata
@@ -642,7 +710,7 @@ func ApplyClusterMetadataConfigProvider(
 			ctx,
 			clusterMetadataManager,
 			svc,
-			initialIndexSearchAttributes,
+			indexSearchAttributes,
 			resp,
 		); updateErr != nil {
 			return svc.ClusterMetadata, svc.Persistence, updateErr
@@ -659,7 +727,7 @@ func ApplyClusterMetadataConfigProvider(
 			ctx,
 			clusterMetadataManager,
 			svc,
-			initialIndexSearchAttributes,
+			indexSearchAttributes,
 			logger,
 		); initErr != nil {
 			return svc.ClusterMetadata, svc.Persistence, initErr
@@ -686,11 +754,11 @@ func initCurrentClusterMetadataRecord(
 	var clusterId string
 	currentClusterName := svc.ClusterMetadata.CurrentClusterName
 	currentClusterInfo := svc.ClusterMetadata.ClusterInformation[currentClusterName]
-	if uuid.Parse(currentClusterInfo.ClusterID) == nil {
+	if uuid.Validate(currentClusterInfo.ClusterID) != nil {
 		if currentClusterInfo.ClusterID != "" {
 			logger.Warn("Cluster Id in Cluster Metadata config is not a valid uuid. Generating a new Cluster Id")
 		}
-		clusterId = uuid.New()
+		clusterId = uuid.NewString()
 	} else {
 		clusterId = currentClusterInfo.ClusterID
 	}
@@ -755,18 +823,8 @@ func updateCurrentClusterMetadataRecord(
 		updateDBRecord = true
 	}
 
-	if len(initialIndexSearchAttributes) > 0 {
-		if currentClusterDBRecord.IndexSearchAttributes == nil {
-			currentClusterDBRecord.IndexSearchAttributes = initialIndexSearchAttributes
-			updateDBRecord = true
-		} else {
-			for indexName, initialValue := range initialIndexSearchAttributes {
-				if _, ok := currentClusterDBRecord.IndexSearchAttributes[indexName]; !ok {
-					currentClusterDBRecord.IndexSearchAttributes[indexName] = initialValue
-					updateDBRecord = true
-				}
-			}
-		}
+	if updateIndexSearchAttributes(initialIndexSearchAttributes, currentClusterDBRecord) {
+		updateDBRecord = true
 	}
 
 	if !updateDBRecord {
@@ -816,6 +874,39 @@ func overwriteCurrentClusterMetadataWithDBRecord(
 			tag.Value(currentClusterDBRecord.FailoverVersionIncrement))
 		svc.ClusterMetadata.FailoverVersionIncrement = currentClusterDBRecord.FailoverVersionIncrement
 	}
+}
+
+// updateIndexSearchAttributes updates the IndexSearchAttributes if needed.
+// Returns true if any change was made.
+func updateIndexSearchAttributes(
+	initialIndexSearchAttributes map[string]*persistencespb.IndexSearchAttributes,
+	currentClusterDBRecord *persistence.GetClusterMetadataResponse,
+) bool {
+	// initialIndexSearchAttributes is non-empty for SQL and custom visibility stores.
+	if len(initialIndexSearchAttributes) == 0 {
+		return false
+	}
+	if currentClusterDBRecord.IndexSearchAttributes == nil {
+		currentClusterDBRecord.IndexSearchAttributes = initialIndexSearchAttributes
+		return true
+	}
+	updateDBRecord := false
+	for indexName, initialValue := range initialIndexSearchAttributes {
+		isa := currentClusterDBRecord.IndexSearchAttributes[indexName]
+		if isa == nil {
+			currentClusterDBRecord.IndexSearchAttributes[indexName] = initialValue
+			updateDBRecord = true
+			continue
+		}
+
+		for k, v := range initialValue.CustomSearchAttributes {
+			if _, ok := isa.CustomSearchAttributes[k]; !ok {
+				isa.CustomSearchAttributes[k] = v
+				updateDBRecord = true
+			}
+		}
+	}
+	return updateDBRecord
 }
 
 func PersistenceFactoryProvider() persistenceClient.FactoryProviderFn {
@@ -1160,6 +1251,13 @@ func (l *fxLogAdapter) LogEvent(e fxevent.Event) {
 				tag.ComponentFX,
 				tag.NewStringTag("function", e.ConstructorName))
 		}
+	case *fxevent.BeforeRun:
+		l.logger.Debug("before run",
+			tag.ComponentFX,
+			tag.NewStringTag("name", e.Name),
+			tag.NewStringTag("kind", e.Kind),
+			tag.NewStringTag("module", e.ModuleName),
+		)
 	default:
 		l.logger.Warn("unknown fx log type, update fxLogAdapter",
 			tag.ComponentFX,

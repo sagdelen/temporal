@@ -1,9 +1,11 @@
+# DISABLED: We use docker-build-push.yml for releases instead
 name: goreleaser
 
 on:
-  release:
-    types:
-      - released
+  workflow_dispatch: # Disabled automatic trigger
+  # release:
+  #   types:
+  #     - released
 
 permissions:
   contents: write
