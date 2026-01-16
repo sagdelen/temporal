@@ -51,6 +51,7 @@ type (
 	// TestBaseOptions options to configure workflow test base.
 	TestBaseOptions struct {
 		SQLDBPluginName   string
+		NoSQLDBPluginName string
 		DBName            string
 		DBUsername        string
 		DBPassword        string
@@ -61,6 +62,7 @@ type (
 		SchemaDir         string `yaml:"-"`
 		FaultInjection    *config.FaultInjection
 		Logger            log.Logger `yaml:"-"`
+		MongoDBConfig     *config.MongoDB
 	}
 )
 
@@ -176,7 +178,15 @@ func NewTestBase(options *TestBaseOptions) *TestBase {
 	case config.StoreTypeSQL:
 		return NewTestBaseWithSQL(options)
 	case config.StoreTypeNoSQL:
-		return NewTestBaseWithCassandra(options)
+		switch options.NoSQLDBPluginName {
+		case "mongodb":
+			return NewTestBaseWithMongoDB(options)
+		default:
+			if options.NoSQLDBPluginName == "" {
+				options.NoSQLDBPluginName = "cassandra"
+			}
+			return NewTestBaseWithCassandra(options)
+		}
 	default:
 		panic("invalid storeType " + options.StoreType)
 	}
@@ -217,6 +227,9 @@ func (s *TestBase) Setup(clusterMetadataConfig *cluster.Config) {
 		s.TracerProvider,
 		serializer,
 	)
+	if visFactory, ok := dataStoreFactory.(visibility.VisibilityStoreFactory); ok {
+		s.VisibilityStoreFactory = visFactory
+	}
 	factory := client.NewFactory(
 		dataStoreFactory,
 		&cfg,

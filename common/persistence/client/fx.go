@@ -10,10 +10,12 @@ import (
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/cassandra"
 	"go.temporal.io/server/common/persistence/faultinjection"
+	"go.temporal.io/server/common/persistence/mongodb"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/telemetry"
@@ -195,10 +197,16 @@ func DataStoreFactoryProvider(
 		dataStoreFactory = cassandra.NewFactory(*defaultStoreCfg.Cassandra, r, string(clusterName), logger, metricsHandler, serializer)
 	case defaultStoreCfg.SQL != nil:
 		dataStoreFactory = sql.NewFactory(*defaultStoreCfg.SQL, r, string(clusterName), logger, metricsHandler, serializer)
+	case defaultStoreCfg.MongoDB != nil:
+		mongoFactory, err := mongodb.NewFactory(*defaultStoreCfg.MongoDB, string(clusterName), logger, metricsHandler)
+		if err != nil {
+			logger.Fatal("unable to initialize mongodb factory", tag.Error(err))
+		}
+		dataStoreFactory = mongoFactory
 	case defaultStoreCfg.CustomDataStoreConfig != nil:
 		dataStoreFactory = abstractDataStoreFactory.NewFactory(*defaultStoreCfg.CustomDataStoreConfig, r, string(clusterName), logger, metricsHandler, serializer)
 	default:
-		logger.Fatal("invalid config: one of cassandra, sql, or custom datastore params must be specified")
+		logger.Fatal("invalid config: one of cassandra, mongodb, sql, or custom datastore params must be specified")
 	}
 
 	if defaultStoreCfg.FaultInjection != nil {

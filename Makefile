@@ -640,6 +640,9 @@ start-sqlite: temporal-server
 start-sqlite-file: temporal-server
 	./temporal-server --config-file config/development-sqlite-file.yaml --allow-no-auth start
 
+start-mongodb: temporal-server
+	./temporal-server --config-file config/development-mongodb.yaml --allow-no-auth start
+
 start-xdc-cluster-a: temporal-server
 	./temporal-server --config-file config/development-cluster-a.yaml --allow-no-auth start
 

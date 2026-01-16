@@ -1,14 +1,15 @@
+# DISABLED: This workflow requires upstream Temporal secrets (TEMPORAL_CICD_APP_ID)
+# We use docker-build-push.yml instead for our own Docker Hub publishing.
 name: 'Trigger Docker image build'
 
 on:
-  push:
-    branches:
-      - main
-      - cloud/*
-      - feature/*
-      - release/*
-permissions:
-  contents: read
+  workflow_dispatch: # Disabled automatic trigger
+  # push:
+  #   branches:
+  #     - main
+  #     - cloud/*
+  #     - feature/*
+  #     - release/*
 
 jobs:
   trigger:
@@ -27,14 +28,10 @@ jobs:
 
       - name: Generate a token
         id: generate_token
-        uses: actions/create-github-app-token@v2
+        uses: tibdex/github-app-token@b62528385c34dbc9f38e5f4225ac829252d1ea92
         with:
-          app-id: ${{ secrets.TEMPORAL_CICD_APP_ID }}
-          private-key: ${{ secrets.TEMPORAL_CICD_PRIVATE_KEY }}
-          owner: temporalio
-          repositories: |
-            temporal
-            docker-builds
+          app_id: ${{ secrets.TEMPORAL_CICD_APP_ID }}
+          private_key: ${{ secrets.TEMPORAL_CICD_PRIVATE_KEY }}
 
       - name: Dispatch docker builds Github Action
         if: ${{ vars.SHOULD_TRIGGER_DOCKER_BUILD == 'true' }}

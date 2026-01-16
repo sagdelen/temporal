@@ -79,6 +79,7 @@ type (
 var (
 	groupByFieldAllowlist = []string{
 		sadefs.ExecutionStatus,
+		"PayloadExecutionStatus",
 	}
 
 	groupByFieldPrefixAllowlist = []string{
@@ -548,6 +549,10 @@ func (c *QueryConverter[ExprT]) resolveSearchAttributeAlias(
 		// To support querying Workflow based schedulers and CHASM based schedulers, we need to translate
 		// TemporalSystemExecutionStatus as an alias to the system search attribute ExecutionStatus.
 		fieldName = "ExecutionStatus"
+	} else if strings.TrimPrefix(alias, sadefs.ReservedPrefix) == sadefs.ActivityID {
+		// Handle ActivityId → WorkflowID transformation for standalone activities.
+		// TODO: Remove this hardcoded transformation.
+		fieldName = sadefs.WorkflowID
 	} else if strings.HasPrefix(fieldName, sadefs.ReservedPrefix) {
 		fieldName = fieldName[len(sadefs.ReservedPrefix):]
 	} else {
