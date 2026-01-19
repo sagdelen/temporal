@@ -2783,7 +2783,7 @@ func (s *executionStore) ReadHistoryBranch(
 
 	findOpts := options.Find().
 		SetSort(sortSpec).
-		SetLimit(int64(limit + 1))
+		SetLimit(int64(limit))
 
 	cursor, err := s.historyNodesCol.Find(ctx, filter, findOpts)
 	if err != nil {
@@ -2813,14 +2813,13 @@ func (s *executionStore) ReadHistoryBranch(
 		return response, nil
 	}
 
-	if len(docs) > limit {
+	if len(docs) >= limit {
 		last := docs[limit-1]
 		tokenBytes, err := encodeHistoryNodePageToken(historyNodePageToken{LastNodeID: last.NodeID, LastTxnID: last.TxnID})
 		if err != nil {
 			return nil, serviceerror.NewUnavailablef("failed to encode history node page token: %v", err)
 		}
 		response.NextPageToken = tokenBytes
-		docs = docs[:limit]
 	}
 
 	nodes := make([]persistence.InternalHistoryNode, len(docs))
