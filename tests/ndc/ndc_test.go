@@ -1577,8 +1577,6 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		})
 	}
 
-	// GetWorkflowExecutionRawHistoryV2 start and end
-
 	eventsBatch1 := []*historypb.History{
 		{Events: []*historypb.HistoryEvent{
 			{
@@ -1963,14 +1961,10 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		token = resp.NextPageToken
-		if len(resp.HistoryBatches) == 0 {
-			s.Empty(token)
-			continue
-		}
 		batchCount++
+		token = resp.NextPageToken
 	}
-	s.Equal(4, batchCount)
+	s.Equal(batchCount, 4)
 
 	// GetWorkflowExecutionRawHistoryV2 start and end not on the same branch
 	token = nil
@@ -1990,19 +1984,14 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		token = resp.NextPageToken
-		if len(resp.HistoryBatches) == 0 {
-			s.Empty(token)
-			continue
-		}
 		batchCount++
+		token = resp.NextPageToken
 	}
-	s.Equal(2, batchCount)
+	s.Equal(batchCount, 2)
 
 	// GetWorkflowExecutionRawHistoryV2 start boundary
 	token = nil
 	batchCount = 0
-	startBoundaryEventIDs := make([]int64, 0)
 	for continuePaging := true; continuePaging; continuePaging = len(token) != 0 {
 		resp, err := getHistory(
 			s.namespace,
@@ -2018,22 +2007,10 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		for _, blob := range resp.HistoryBatches {
-			events, err := s.serializer.DeserializeEvents(blob)
-			s.Require().NoError(err)
-			for _, evt := range events {
-				startBoundaryEventIDs = append(startBoundaryEventIDs, evt.GetEventId())
-			}
-		}
-		token = resp.NextPageToken
-		if len(resp.HistoryBatches) == 0 {
-			s.Empty(token)
-			continue
-		}
 		batchCount++
+		token = resp.NextPageToken
 	}
-	s.Equal(3, batchCount)
-	s.T().Logf("start boundary events: %v", startBoundaryEventIDs)
+	s.Equal(batchCount, 3)
 
 	// GetWorkflowExecutionRawHistoryV2 end boundary
 	token = nil
@@ -2053,14 +2030,10 @@ func (s *NDCFunctionalTestSuite) TestResend() {
 		)
 		s.NoError(err)
 		s.True(len(resp.HistoryBatches) <= 1)
-		token = resp.NextPageToken
-		if len(resp.HistoryBatches) == 0 {
-			s.Empty(token)
-			continue
-		}
 		batchCount++
+		token = resp.NextPageToken
 	}
-	s.Equal(10, batchCount)
+	s.Equal(batchCount, 10)
 }
 
 func (s *NDCFunctionalTestSuite) registerNamespace() {
