@@ -334,6 +334,7 @@ jobs:
             cassandra
             mysql
             postgresql
+            mongodb
           down-flags: -v
           wait: true
 
