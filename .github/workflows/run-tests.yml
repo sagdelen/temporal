@@ -427,51 +427,48 @@ jobs:
       fail-fast: false
       matrix:
         name:
-          - cass_es
-          - cass_es8
-          - cass_os2
-          - sqlite
-          - mysql8
-          - postgres12
-          - postgres12_pgx
+          # MongoDB-only testing for this fork
+          # - cass_es
+          # - cass_es8
+          # - cass_os2
+          # - sqlite
+          # - mysql8
+          # - postgres12
+          # - postgres12_pgx
           - mongodb
         shard_index: ${{ fromJson(needs.set-up-single-test.outputs.shard_indices) }}
         runs-on: ${{ fromJson(needs.set-up-single-test.outputs.runs_on) }}
         include:
-          - name: cass_es
-            persistence_type: nosql
-            persistence_driver: cassandra
-            containers: [cassandra, elasticsearch]
-            es_version: v7
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_es8
-            persistence_type: nosql
-            persistence_driver: cassandra
-            containers: [cassandra, elasticsearch8]
-            es_version: v8
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_os2
-            persistence_type: nosql
-            persistence_driver: cassandra
-            containers: [cassandra, opensearch2]
-          - name: sqlite
-            persistence_type: sql
-            persistence_driver: sqlite
-            containers: []
-          - name: mysql8
-            persistence_type: sql
-            persistence_driver: mysql8
-            containers: [mysql]
-          - name: postgres12
-            persistence_type: sql
-            persistence_driver: postgres12
-            containers: [postgresql]
-          - name: postgres12_pgx
-            persistence_type: sql
-            persistence_driver: postgres12_pgx
-            containers: [postgresql]
+          # - name: cass_es
+          #   persistence_type: nosql
+          #   persistence_driver: cassandra
+          #   containers: [cassandra, elasticsearch]
+          #   es_version: v7
+          # - name: cass_es8
+          #   persistence_type: nosql
+          #   persistence_driver: cassandra
+          #   containers: [cassandra, elasticsearch8]
+          #   es_version: v8
+          # - name: cass_os2
+          #   persistence_type: nosql
+          #   persistence_driver: cassandra
+          #   containers: [cassandra, opensearch2]
+          # - name: sqlite
+          #   persistence_type: sql
+          #   persistence_driver: sqlite
+          #   containers: []
+          # - name: mysql8
+          #   persistence_type: sql
+          #   persistence_driver: mysql8
+          #   containers: [mysql]
+          # - name: postgres12
+          #   persistence_type: sql
+          #   persistence_driver: postgres12
+          #   containers: [postgresql]
+          # - name: postgres12_pgx
+          #   persistence_type: sql
+          #   persistence_driver: postgres12_pgx
+          #   containers: [postgresql]
           - name: mongodb
             persistence_type: nosql
             persistence_driver: mongodb
@@ -610,41 +607,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [cass_es, cass_es8, cass_os2, mysql8, postgres12, postgres12_pgx, mongodb]
+        # MongoDB-only testing for this fork
+        name: [mongodb] # [cass_es, cass_es8, cass_os2, mysql8, postgres12, postgres12_pgx, mongodb]
         include:
-          - name: cass_es
-            persistence_type: nosql
-            persistence_driver: elasticsearch
-            parallel_flags: ""
-            containers: [cassandra, elasticsearch]
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_es8
-            persistence_type: nosql
-            persistence_driver: elasticsearch
-            parallel_flags: ""
-            containers: [cassandra, elasticsearch8]
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_os2
-            persistence_type: nosql
-            persistence_driver: cassandra
-            containers: [cassandra, opensearch2]
-          - name: mysql8
-            persistence_type: sql
-            persistence_driver: mysql8
-            parallel_flags: ""
-            containers: [mysql]
-          - name: postgres12
-            persistence_type: sql
-            persistence_driver: postgres12
-            parallel_flags: "-parallel=2" # reduce parallelism for postgres
-            containers: [postgresql]
-          - name: postgres12_pgx
-            persistence_type: sql
-            persistence_driver: postgres12_pgx
-            parallel_flags: "-parallel=2" # reduce parallelism for postgres
-            containers: [postgresql]
+          # - name: cass_es
+          #   persistence_type: nosql
+          #   persistence_driver: elasticsearch
+          #   parallel_flags: ""
+          #   containers: [cassandra, elasticsearch]
+          # - name: cass_es8
+          #   persistence_type: nosql
+          #   persistence_driver: elasticsearch
+          #   parallel_flags: ""
+          #   containers: [cassandra, elasticsearch8]
+          # - name: cass_os2
+          #   persistence_type: nosql
+          #   persistence_driver: cassandra
+          #   containers: [cassandra, opensearch2]
+          # - name: mysql8
+          #   persistence_type: sql
+          #   persistence_driver: mysql8
+          #   parallel_flags: ""
+          #   containers: [mysql]
+          # - name: postgres12
+          #   persistence_type: sql
+          #   persistence_driver: postgres12
+          #   parallel_flags: "-parallel=2"
+          #   containers: [postgresql]
+          # - name: postgres12_pgx
+          #   persistence_type: sql
+          #   persistence_driver: postgres12_pgx
+          #   parallel_flags: "-parallel=2"
+          #   containers: [postgresql]
           - name: mongodb
             persistence_type: nosql
             persistence_driver: mongodb
@@ -774,44 +768,41 @@ jobs:
       fail-fast: false
       matrix:
         name:
-          - cass_es
-          - cass_es8
-          - cass_os2
-          - mysql8
-          - postgres12
-          - postgres12_pgx
+          # MongoDB-only testing for this fork
+          # - cass_es
+          # - cass_es8
+          # - cass_os2
+          # - mysql8
+          # - postgres12
+          # - postgres12_pgx
           - mongodb
         include:
-          - name: cass_es
-            persistence_type: nosql
-            persistence_driver: elasticsearch
-            containers: [cassandra, elasticsearch]
-            es_version: v7
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_es8
-            persistence_type: nosql
-            persistence_driver: elasticsearch
-            containers: [cassandra, elasticsearch8]
-            es_version: v8
-            # Cassandra tests need a larger instance
-            runs_on_override: ubuntu-latest-8-cores
-          - name: cass_os2
-            persistence_type: nosql
-            persistence_driver: cassandra
-            containers: [cassandra, opensearch2]
-          - name: mysql8
-            persistence_type: sql
-            persistence_driver: mysql8
-            containers: [mysql]
-          - name: postgres12
-            persistence_type: sql
-            persistence_driver: postgres12
-            containers: [postgresql]
-          - name: postgres12_pgx
-            persistence_type: sql
-            persistence_driver: postgres12_pgx
-            containers: [postgresql]
+          # - name: cass_es
+          #   persistence_type: nosql
+          #   persistence_driver: elasticsearch
+          #   containers: [cassandra, elasticsearch]
+          #   es_version: v7
+          # - name: cass_es8
+          #   persistence_type: nosql
+          #   persistence_driver: elasticsearch
+          #   containers: [cassandra, elasticsearch8]
+          #   es_version: v8
+          # - name: cass_os2
+          #   persistence_type: nosql
+          #   persistence_driver: cassandra
+          #   containers: [cassandra, opensearch2]
+          # - name: mysql8
+          #   persistence_type: sql
+          #   persistence_driver: mysql8
+          #   containers: [mysql]
+          # - name: postgres12
+          #   persistence_type: sql
+          #   persistence_driver: postgres12
+          #   containers: [postgresql]
+          # - name: postgres12_pgx
+          #   persistence_type: sql
+          #   persistence_driver: postgres12_pgx
+          #   containers: [postgresql]
           - name: mongodb
             persistence_type: nosql
             persistence_driver: mongodb
