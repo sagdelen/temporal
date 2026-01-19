@@ -407,9 +407,11 @@ func (s *ActivityApiRulesClientTestSuite) TestActivityRulesApi_RetryTask() {
 
 	testRetryTaskWorkflow := newInternalRulesTestWorkflow(ctx, &s.FunctionalTestBase, s.Logger)
 
-	// set much longer retry interval to make sure that activity is retried at least once
-	s.initialRetryInterval = 4 * time.Second
-	s.activityRetryPolicy.InitialInterval = s.initialRetryInterval
+	// set longer retry interval to allow namespace config propagation (cache refresh + history service update)
+	// Original test used 4s but with NamespaceCacheRefreshInterval=1s, config propagation can take 2-3s in CI
+	// Using 6s gives enough buffer for: DB write → cache refresh (1s) → history service sees update (1s) + margin
+	testRetryTaskWorkflow.initialRetryInterval = 6 * time.Second
+	testRetryTaskWorkflow.activityRetryPolicy.InitialInterval = testRetryTaskWorkflow.initialRetryInterval
 
 	s.Worker().RegisterWorkflow(testRetryTaskWorkflow.WorkflowFuncForRetryTask)
 	s.Worker().RegisterActivity(testRetryTaskWorkflow.ActivityFuncForRetryTask)
