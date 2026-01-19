@@ -67,7 +67,7 @@ func (s *VisibilityTestSuite) TearDownSuite() {
 
 func (s *VisibilityTestSuite) TestSearchAttributes() {
 	ns := s.createGlobalNamespace()
-	if testcore.UseSQLVisibility() {
+	if testcore.UseSQLVisibility() || testcore.UseMongoDBVisibility() {
 		// When Elasticsearch is enabled, the search attribute aliases are not used.
 		updateNamespaceConfig(s.Assertions, ns,
 			func() *namespacepb.NamespaceConfig {
