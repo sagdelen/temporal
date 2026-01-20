@@ -45,7 +45,7 @@ jobs:
     secrets: inherit
 
   docker:
-    needs: [determine, tests]
+    needs: determine
     if: needs.determine.outputs.is_datetime == 'true'
     uses: ./.github/workflows/docker-build-push.yml
     with:
