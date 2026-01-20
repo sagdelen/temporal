@@ -70,8 +70,33 @@ jobs:
             TEMPORAL_VERSION="unknown"
           fi
 
+          # Extract version hierarchy for MongoDB tags
+          # Example: 1.30.0-148.3-mongo.1-20260119T213020Z
+          # Tag strategy:
+          # 1. BASE (1.30.0-mongo) - Updates only when major.minor.patch changes
+          # 2. PLUGIN (1.30.0-148.3-mongo.1) - Updates when cloud patch or plugin revision changes
+          # 3. FULL (1.30.0-148.3-mongo.1-20260119T213020Z) - Unique for every build
+          if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9]+\.[0-9]+)?(-mongo(\.[0-9]+)?)?(-[0-9]{8}T[0-9]{6}Z)?$ ]]; then
+            BASE_VERSION="${BASH_REMATCH[1]}"  # 1.30.0
+            
+            # Base tag: only major.minor.patch, acts as "latest" for this version
+            BASE_TAG="${BASE_VERSION}-mongo"
+            
+            # Plugin tag: includes cloud patch and plugin revision, no timestamp
+            PLUGIN_TAG="${VERSION%%-[0-9]*T[0-9]*Z}"  # Remove timestamp only
+            
+            # Full tag: everything including timestamp (unique per build)
+            FULL_TAG="$VERSION"
+          else
+            BASE_TAG="$VERSION"
+            PLUGIN_TAG="$VERSION"
+            FULL_TAG="$VERSION"
+          fi
+
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "base_tag=$BASE_TAG" >> $GITHUB_OUTPUT
+          echo "plugin_tag=$PLUGIN_TAG" >> $GITHUB_OUTPUT
+          echo "full_tag=$FULL_TAG" >> $GITHUB_OUTPUT
           echo "temporal_version=$TEMPORAL_VERSION" >> $GITHUB_OUTPUT
           echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
           echo "unix_timestamp=$UNIX_TIMESTAMP" >> $GITHUB_OUTPUT
@@ -85,11 +110,9 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.timestamp }}
-            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:dev-${{ steps.version.outputs.temporal_version }}
-            ${{ steps.version.outputs.is_stable == 'true' && format('{0}/{1}:{2}', env.DOCKER_HUB_USERNAME, env.IMAGE_NAME, steps.version.outputs.tag) || '' }}
-            ${{ steps.version.outputs.is_stable == 'true' && format('{0}/{1}:{2}', env.DOCKER_HUB_USERNAME, env.IMAGE_NAME, steps.version.outputs.version) || '' }}
-            ${{ steps.version.outputs.is_stable == 'true' && format('{0}/{1}:latest-{2}', env.DOCKER_HUB_USERNAME, env.IMAGE_NAME, steps.version.outputs.temporal_version) || '' }}
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.base_tag }}
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.plugin_tag }}
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.full_tag }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
