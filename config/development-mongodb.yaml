@@ -1,11 +1,13 @@
+# enable-template
+
 log:
   stdout: true
-  level: info
+  level: {{ default "info" (env "LOG_LEVEL") }}
 
 persistence:
   defaultStore: mongodb-default
   visibilityStore: mongodb-visibility
-  numHistoryShards: 1
+  numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
   datastores:
     mongodb-default:
       customDataStoreConfig:
@@ -14,12 +16,12 @@ persistence:
         options:
           type: persistence
       mongodb:
-        hosts: ["localhost:27017"]
-        user: temporal
-        password: temporal
+        hosts: ["{{ default "127.0.0.1:27017" (env "MONGODB_SEEDS") }}"]
+        user: {{ default "temporal" (env "MONGODB_USER") }}
+        password: {{ default "temporal" (env "MONGODB_PASSWORD") }}
         authSource: admin
-        databaseName: temporal
-        replicaSet: rs0
+        databaseName: {{ default "temporal" (env "MONGODB_DATABASE") }}
+        replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") }}
         maxConns: 50
     mongodb-visibility:
       customDataStoreConfig:
@@ -28,51 +30,46 @@ persistence:
         options:
           type: visibility
       mongodb:
-        hosts: ["localhost:27017"]
-        user: temporal
-        password: temporal
+        hosts: ["{{ default "127.0.0.1:27017" (env "MONGODB_SEEDS") }}"]
+        user: {{ default "temporal" (env "MONGODB_USER") }}
+        password: {{ default "temporal" (env "MONGODB_PASSWORD") }}
         authSource: admin
-        databaseName: temporal
-        replicaSet: rs0
+        databaseName: {{ default "temporal" (env "MONGODB_DATABASE") }}
+        replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") }}
         maxConns: 20
 
 global:
   membership:
     maxJoinDuration: 30s
-    broadcastAddress: "127.0.0.1"
+    broadcastAddress: {{ default "127.0.0.1" (env "TEMPORAL_BROADCAST_ADDRESS") | quote }}
   pprof:
-    port: 7936
-  metrics:
-    prometheus:
-      framework: tally
-      timerType: histogram
-      listenAddress: "127.0.0.1:8000"
+    port: {{ default "7936" (env "PPROF_PORT") }}
 
 services:
   frontend:
     rpc:
-      grpcPort: 7233
-      membershipPort: 6933
-      bindOnLocalHost: true
-      httpPort: 7243
+      grpcPort: {{ default "7233" (env "FRONTEND_GRPC_PORT") }}
+      membershipPort: {{ default "6933" (env "FRONTEND_MEMBERSHIP_PORT") }}
+      bindOnIP: {{ default "127.0.0.1" (env "BIND_ON_IP") | quote }}
+      httpPort: {{ default "7243" (env "FRONTEND_HTTP_PORT") }}
 
   matching:
     rpc:
-      grpcPort: 7235
-      membershipPort: 6935
-      bindOnLocalHost: true
+      grpcPort: {{ default "7235" (env "MATCHING_GRPC_PORT") }}
+      membershipPort: {{ default "6935" (env "MATCHING_MEMBERSHIP_PORT") }}
+      bindOnIP: {{ default "127.0.0.1" (env "BIND_ON_IP") | quote }}
 
   history:
     rpc:
-      grpcPort: 7234
-      membershipPort: 6934
-      bindOnLocalHost: true
+      grpcPort: {{ default "7234" (env "HISTORY_GRPC_PORT") }}
+      membershipPort: {{ default "6934" (env "HISTORY_MEMBERSHIP_PORT") }}
+      bindOnIP: {{ default "127.0.0.1" (env "BIND_ON_IP") | quote }}
 
   worker:
     rpc:
-      grpcPort: 7239
-      membershipPort: 6939
-      bindOnLocalHost: true
+      grpcPort: {{ default "7239" (env "WORKER_GRPC_PORT") }}
+      membershipPort: {{ default "6939" (env "WORKER_MEMBERSHIP_PORT") }}
+      bindOnIP: {{ default "127.0.0.1" (env "BIND_ON_IP") | quote }}
 
 clusterMetadata:
   enableGlobalNamespace: false
@@ -84,8 +81,8 @@ clusterMetadata:
       enabled: true
       initialFailoverVersion: 1
       rpcName: "frontend"
-      rpcAddress: "localhost:7233"
-      httpAddress: "localhost:7243"
+      rpcAddress: "{{ default "127.0.0.1" (env "BIND_ON_IP") }}:{{ default "7233" (env "FRONTEND_GRPC_PORT") }}"
+      httpAddress: "{{ default "127.0.0.1" (env "BIND_ON_IP") }}:{{ default "7243" (env "FRONTEND_HTTP_PORT") }}"
 
 dcRedirectionPolicy:
   policy: noop
@@ -98,8 +95,6 @@ archival:
       filestore:
         fileMode: "0666"
         dirMode: "0766"
-      gstorage:
-        credentialsPath: "/tmp/gcloud/keyfile.json"
   visibility:
     state: enabled
     enableRead: true
@@ -118,5 +113,5 @@ namespaceDefaults:
       URI: "file:///tmp/temporal_vis_archival/development"
 
 dynamicConfigClient:
-  filepath: "config/dynamicconfig/development-sql.yaml"
-  pollInterval: 10s
+  filepath: {{ default "config/dynamicconfig/development-sql.yaml" (env "DYNAMIC_CONFIG_FILE_PATH") | quote }}
+  pollInterval: {{ default "10s" (env "DYNAMIC_CONFIG_POLL_INTERVAL") }}
