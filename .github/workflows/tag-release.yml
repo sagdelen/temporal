@@ -18,26 +18,43 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.determine.outputs.tag }}
-      is_datetime: ${{ steps.determine.outputs.is_datetime }}
+      docker_tag: ${{ steps.determine.outputs.docker_tag }}
+      skip_tests: ${{ steps.determine.outputs.skip_tests }}
+      build_docker: ${{ steps.determine.outputs.build_docker }}
       is_stable: ${{ steps.determine.outputs.is_stable }}
     steps:
       - name: Determine tag
         id: determine
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if [[ "$TAG" =~ ^v.*-mongo\.[0-9]+-[0-9]{8}T[0-9]{6}Z$ ]]; then
-            IS_DATETIME=true
+          DOCKER_TAG="$TAG"
+          # Fast build: skip tests, docker only
+          if [[ "$TAG" =~ -fast$ ]]; then
+            SKIP_TESTS=true
+            BUILD_DOCKER=true
             IS_STABLE=false
+            # Remove -fast suffix from Docker tag
+            DOCKER_TAG="${TAG%-fast}"
+          # Datetime tag: tests + docker (parallel)
+          elif [[ "$TAG" =~ ^v.*-mongo\.[0-9]+-[0-9]{8}T[0-9]{6}Z$ ]]; then
+            SKIP_TESTS=false
+            BUILD_DOCKER=true
+            IS_STABLE=false
+          # Stable tag: tests + docker + release
           else
-            IS_DATETIME=false
+            SKIP_TESTS=false
+            BUILD_DOCKER=true
             IS_STABLE=true
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "is_datetime=$IS_DATETIME" >> "$GITHUB_OUTPUT"
+          echo "docker_tag=$DOCKER_TAG" >> "$GITHUB_OUTPUT"
+          echo "skip_tests=$SKIP_TESTS" >> "$GITHUB_OUTPUT"
+          echo "build_docker=$BUILD_DOCKER" >> "$GITHUB_OUTPUT"
           echo "is_stable=$IS_STABLE" >> "$GITHUB_OUTPUT"
 
   tests:
     needs: determine
+    if: needs.determine.outputs.skip_tests != 'true'
     uses: ./.github/workflows/run-tests.yml
     with:
       ref: ${{ needs.determine.outputs.tag }}
@@ -46,10 +63,10 @@ jobs:
 
   docker:
     needs: determine
-    if: needs.determine.outputs.is_datetime == 'true'
+    if: needs.determine.outputs.build_docker == 'true'
     uses: ./.github/workflows/docker-build-push.yml
     with:
-      tag: ${{ needs.determine.outputs.tag }}
+      tag: ${{ needs.determine.outputs.docker_tag }}
     secrets: inherit
 
   release:
