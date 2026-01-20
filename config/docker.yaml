@@ -173,12 +173,12 @@ persistence:
                     options:
                         type: visibility
                 mongodb:
-                    hosts: ["{{ coalesce (env "VISIBILITY_MONGODB_SEEDS") (env "MONGODB_SEEDS") }}"]
-                    user: {{ coalesce (env "VISIBILITY_MONGODB_USER") (env "MONGODB_USER") | quote }}
-                    password: {{ coalesce (env "VISIBILITY_MONGODB_PASSWORD") (env "MONGODB_PASSWORD") | quote }}
+                    hosts: ["{{ env "MONGODB_SEEDS" }}"]
+                    user: {{ env "MONGODB_USER" | quote }}
+                    password: {{ env "MONGODB_PASSWORD" | quote }}
                     authSource: admin
-                    databaseName: {{ default "temporal_visibility" (env "VISIBILITY_MONGODB_DATABASE") | quote }}
-                    replicaSet: {{ default "rs0" (env "VISIBILITY_MONGODB_REPLICA_SET") | quote }}
+                    databaseName: {{ default "temporal_visibility" (env "MONGODB_DATABASE") | quote }}
+                    replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") | quote }}
                     maxConns: {{ default "10" (env "MONGODB_VIS_MAX_CONNS") }}
             {{- else -}}
               {{- fail "No visibility configured. Cassandra is no longer supported for visibility." -}}
