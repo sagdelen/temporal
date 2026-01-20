@@ -95,8 +95,7 @@ persistence:
                 options:
                     type: persistence
             mongodb:
-                {{ $mongodb_seeds := env "MONGODB_SEEDS" }}
-                hosts: [{{ $mongodb_seeds }}]
+                hosts: [{{ env "MONGODB_SEEDS" | quote }}]
                 user: {{ env "MONGODB_USER" | quote }}
                 password: {{ env "MONGODB_PASSWORD" | quote }}
                 authSource: admin
@@ -174,12 +173,9 @@ persistence:
                 options:
                     type: visibility
             mongodb:
-                {{ $visibility_seeds := coalesce (env "VISIBILITY_MONGODB_SEEDS") (env "MONGODB_SEEDS") }}
-                {{ $visibility_user := coalesce (env "VISIBILITY_MONGODB_USER") (env "MONGODB_USER") }}
-                {{ $visibility_pwd := coalesce (env "VISIBILITY_MONGODB_PASSWORD") (env "MONGODB_PASSWORD") }}
-                hosts: [{{ $visibility_seeds }}]
-                user: {{ $visibility_user | quote }}
-                password: {{ $visibility_pwd | quote }}
+                hosts: [{{ coalesce (env "VISIBILITY_MONGODB_SEEDS") (env "MONGODB_SEEDS") | quote }}]
+                user: {{ coalesce (env "VISIBILITY_MONGODB_USER") (env "MONGODB_USER") | quote }}
+                password: {{ coalesce (env "VISIBILITY_MONGODB_PASSWORD") (env "MONGODB_PASSWORD") | quote }}
                 authSource: admin
                 databaseName: {{ default "temporal_visibility" (env "VISIBILITY_MONGODB_DATABASE") | quote }}
                 replicaSet: {{ default "rs0" (env "VISIBILITY_MONGODB_REPLICA_SET") | quote }}
