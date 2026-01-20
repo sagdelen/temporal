@@ -95,7 +95,7 @@ persistence:
                 options:
                     type: persistence
             mongodb:
-                hosts: [{{ env "MONGODB_SEEDS" | quote }}]
+                hosts: ["{{ env "MONGODB_SEEDS" }}"]
                 user: {{ env "MONGODB_USER" | quote }}
                 password: {{ env "MONGODB_PASSWORD" | quote }}
                 authSource: admin
@@ -173,7 +173,7 @@ persistence:
                 options:
                     type: visibility
             mongodb:
-                hosts: [{{ coalesce (env "VISIBILITY_MONGODB_SEEDS") (env "MONGODB_SEEDS") | quote }}]
+                hosts: ["{{ coalesce (env "VISIBILITY_MONGODB_SEEDS") (env "MONGODB_SEEDS") }}"]
                 user: {{ coalesce (env "VISIBILITY_MONGODB_USER") (env "MONGODB_USER") | quote }}
                 password: {{ coalesce (env "VISIBILITY_MONGODB_PASSWORD") (env "MONGODB_PASSWORD") | quote }}
                 authSource: admin
