@@ -1778,28 +1778,30 @@ func (s *executionStore) UpdateWorkflowExecution(
 		return serviceerror.NewInvalidArgument("UpdateWorkflowExecution request is nil")
 	}
 
-	for _, appendReq := range request.UpdateWorkflowNewEvents {
-		if appendReq == nil {
-			continue
-		}
-		if err := s.AppendHistoryNodes(ctx, appendReq); err != nil {
-			return err
-		}
-	}
-	for _, appendReq := range request.NewWorkflowNewEvents {
-		if appendReq == nil {
-			continue
-		}
-		if err := s.AppendHistoryNodes(ctx, appendReq); err != nil {
-			return err
-		}
-	}
-
 	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 		// Write fence: verify shard ownership before any writes
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
+
+		// Append history nodes INSIDE transaction for atomicity
+		for _, appendReq := range request.UpdateWorkflowNewEvents {
+			if appendReq == nil {
+				continue
+			}
+			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
+				return nil, err
+			}
+		}
+		for _, appendReq := range request.NewWorkflowNewEvents {
+			if appendReq == nil {
+				continue
+			}
+			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
+				return nil, err
+			}
+		}
+
 		return nil, s.applyUpdateWorkflowExecution(sessCtx, request)
 	})
 	return err
