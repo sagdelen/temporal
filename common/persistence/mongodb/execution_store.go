@@ -1785,21 +1785,12 @@ func (s *executionStore) UpdateWorkflowExecution(
 		}
 
 		// Append history nodes INSIDE transaction for atomicity
-		for _, appendReq := range request.UpdateWorkflowNewEvents {
-			if appendReq == nil {
-				continue
-			}
-			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
-				return nil, err
-			}
+		eventBatches := [][]*persistence.InternalAppendHistoryNodesRequest{
+			request.UpdateWorkflowNewEvents,
+			request.NewWorkflowNewEvents,
 		}
-		for _, appendReq := range request.NewWorkflowNewEvents {
-			if appendReq == nil {
-				continue
-			}
-			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
-				return nil, err
-			}
+		if err := s.appendHistoryNodeBatches(sessCtx, eventBatches); err != nil {
+			return nil, err
 		}
 
 		return nil, s.applyUpdateWorkflowExecution(sessCtx, request)
@@ -1851,34 +1842,35 @@ func (s *executionStore) ConflictResolveWorkflowExecution(
 		}
 
 		// Append history nodes INSIDE transaction for atomicity
-		for _, appendReq := range request.CurrentWorkflowEventsNewEvents {
-			if appendReq == nil {
-				continue
-			}
-			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
-				return nil, err
-			}
+		eventBatches := [][]*persistence.InternalAppendHistoryNodesRequest{
+			request.CurrentWorkflowEventsNewEvents,
+			request.ResetWorkflowEventsNewEvents,
+			request.NewWorkflowEventsNewEvents,
 		}
-		for _, appendReq := range request.ResetWorkflowEventsNewEvents {
-			if appendReq == nil {
-				continue
-			}
-			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
-				return nil, err
-			}
-		}
-		for _, appendReq := range request.NewWorkflowEventsNewEvents {
-			if appendReq == nil {
-				continue
-			}
-			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
-				return nil, err
-			}
+		if err := s.appendHistoryNodeBatches(sessCtx, eventBatches); err != nil {
+			return nil, err
 		}
 
 		return nil, s.applyConflictResolveWorkflowExecution(sessCtx, request)
 	})
 	return err
+}
+
+func (s *executionStore) appendHistoryNodeBatches(
+	ctx context.Context,
+	batches [][]*persistence.InternalAppendHistoryNodesRequest,
+) error {
+	for _, batch := range batches {
+		for _, appendReq := range batch {
+			if appendReq == nil {
+				continue
+			}
+			if err := s.AppendHistoryNodes(ctx, appendReq); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 //nolint:revive // cyclomatic complexity reflects persistence conflict resolution flow.

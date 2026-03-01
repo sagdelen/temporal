@@ -79,7 +79,6 @@ func NewFrontendHandler(
 func (h *frontendHandler) StartActivityExecution(ctx context.Context, req *workflowservice.StartActivityExecutionRequest) (*workflowservice.StartActivityExecutionResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
 		return nil, err
 	}
@@ -105,10 +104,6 @@ func (h *frontendHandler) DescribeActivityExecution(
 ) (*workflowservice.DescribeActivityExecutionResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	err := ValidateDescribeActivityExecutionRequest(
-		req,
-		h.config.MaxIDLengthLimit(),
-	)
 	if err != nil {
 		return nil, err
 	}
@@ -132,10 +127,6 @@ func (h *frontendHandler) PollActivityExecution(
 ) (*workflowservice.PollActivityExecutionResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	err := ValidatePollActivityExecutionRequest(
-		req,
-		h.config.MaxIDLengthLimit(),
-	)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +148,6 @@ func (h *frontendHandler) ListActivityExecutions(
 ) (*workflowservice.ListActivityExecutionsResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +203,6 @@ func (h *frontendHandler) CountActivityExecutions(
 ) (*workflowservice.CountActivityExecutionsResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +237,6 @@ func (h *frontendHandler) TerminateActivityExecution(
 ) (*workflowservice.TerminateActivityExecutionResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	namespaceName := req.GetNamespace()
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(namespaceName))
 	if err != nil {
 		return nil, err
@@ -294,7 +282,6 @@ func (h *frontendHandler) RequestCancelActivityExecution(
 ) (*workflowservice.RequestCancelActivityExecutionResponse, error) {
 	return nil, ErrStandaloneActivityDisabled //nolint:all
 
-	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
 		return nil, err
 	}
