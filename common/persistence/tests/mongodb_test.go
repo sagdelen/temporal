@@ -6,7 +6,6 @@ import (
 
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/server/common/config"
-	"go.temporal.io/server/common/persistence"
 	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
 	"go.temporal.io/server/common/persistence/serialization"
 )
@@ -69,7 +68,6 @@ func TestMongoDBExecutionMutableStateStoreSuite(t *testing.T) {
 		shardStore,
 		store,
 		serialization.NewSerializer(),
-		&persistence.HistoryBranchUtilImpl{},
 		testData.Logger,
 	)
 	suite.Run(t, s)

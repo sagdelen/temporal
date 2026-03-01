@@ -432,7 +432,7 @@ func (s *ChasmVisibilityManagerSuite) TestListExecutions_WithTaskQueueSearchAttr
 	s.NoError(err)
 
 	visibilityMgr := manager.NewMockVisibilityManager(ctrl)
-	chasmVisMgr := NewChasmVisibilityManager(registry, visibilityMgr)
+	chasmVisMgr := visibilitypkg.NewChasmVisibilityManager(registry, visibilityMgr)
 
 	ctx := context.Background()
 	query := "TaskQueue = 'my-task-queue'"

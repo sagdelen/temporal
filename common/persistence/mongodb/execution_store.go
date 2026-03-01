@@ -42,7 +42,7 @@ const (
 
 type (
 	executionStore struct {
-		persistence.HistoryBranchUtilImpl
+		persistence.HistoryBranchUtil
 
 		transactionalStore
 
@@ -217,6 +217,7 @@ func NewExecutionStore(
 	}
 
 	store := &executionStore{
+		HistoryBranchUtil:   persistence.NewHistoryBranchUtil(serialization.NewSerializer()),
 		transactionalStore:  newTransactionalStore(mongoClient, metricsHandler),
 		db:                  db,
 		cfg:                 cfg,
@@ -246,6 +247,10 @@ func NewExecutionStore(
 
 func (s *executionStore) GetName() string {
 	return "mongodb"
+}
+
+func (s *executionStore) GetHistoryBranchUtil() persistence.HistoryBranchUtil {
+	return s.HistoryBranchUtil
 }
 
 func (s *executionStore) Close() {
@@ -2451,7 +2456,7 @@ func (s *executionStore) PutReplicationTaskToDLQ(
 		return serviceerror.NewInvalidArgument("PutReplicationTaskToDLQ missing task info")
 	}
 
-	blob, err := serialization.ReplicationTaskInfoToBlob(request.TaskInfo)
+	blob, err := s.serializer.ReplicationTaskInfoToBlob(request.TaskInfo)
 	if err != nil {
 		return err
 	}
