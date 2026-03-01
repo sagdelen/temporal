@@ -1014,6 +1014,8 @@ func encodeGroupValuePayload(col *query.SAColumn, raw any) (*commonpb.Payload, e
 			value = v
 		case float64:
 			value = int64(v)
+		default:
+			// No conversion needed.
 		}
 	case enumspb.INDEXED_VALUE_TYPE_DOUBLE:
 		switch v := value.(type) {
@@ -1023,6 +1025,8 @@ func encodeGroupValuePayload(col *query.SAColumn, raw any) (*commonpb.Payload, e
 			value = float64(v)
 		case float64:
 			value = v
+		default:
+			// No conversion needed.
 		}
 	case enumspb.INDEXED_VALUE_TYPE_KEYWORD, enumspb.INDEXED_VALUE_TYPE_TEXT:
 		switch v := value.(type) {
@@ -1034,6 +1038,8 @@ func encodeGroupValuePayload(col *query.SAColumn, raw any) (*commonpb.Payload, e
 			value = fmt.Sprint(v)
 		case float64:
 			value = fmt.Sprint(int64(v))
+		default:
+			// No conversion needed.
 		}
 	default:
 		// No additional normalization required for other types.
@@ -1058,10 +1064,12 @@ func toWorkflowExecutionStatus(raw any) (enumspb.WorkflowExecutionStatus, error)
 		if val, ok := enumspb.WorkflowExecutionStatus_value[v]; ok {
 			return enumspb.WorkflowExecutionStatus(val), nil
 		}
+		return 0, serviceerror.NewInternalf("unsupported aggregation key value %q for ExecutionStatus", v)
 	case nil:
 		return 0, serviceerror.NewInternal("group aggregation returned nil execution status")
+	default:
+		return 0, serviceerror.NewInternalf("unsupported aggregation key type %T for ExecutionStatus", raw)
 	}
-	return 0, serviceerror.NewInternalf("unsupported aggregation key type %T for ExecutionStatus", raw)
 }
 
 func (s *visibilityStore) buildVisibilityDocument(ctx context.Context, base *store.InternalVisibilityRequestBase) (*visibilityExecutionDocument, error) {

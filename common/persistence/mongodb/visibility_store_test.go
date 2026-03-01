@@ -492,6 +492,8 @@ func filterContains(val interface{}, key string, expected interface{}) bool {
 				return true
 			}
 		}
+	default:
+		// Unsupported type, no match.
 	}
 	return false
 }
