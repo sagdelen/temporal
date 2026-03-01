@@ -87,11 +87,11 @@ Notes:
 
 The `tag-release.yml` workflow recognizes three tag patterns, all matching the glob `v*-mongo.*`:
 
-| Type          | Pattern                                       | Example                            | Tests | Docker | GitHub Release |
-| ------------- | --------------------------------------------- | ---------------------------------- | ----- | ------ | -------------- |
-| **Stable**    | `v{upstream}-mongo.{N}`                        | `v1.30.0-148.6-mongo.2`           | Yes   | Yes    | Yes            |
-| **Datetime**  | `v{upstream}-mongo.{N}-{YYYYMMDDTHHMMSSZ}`    | `v1.30.0-148.6-mongo.2-20260301T140000Z` | Yes   | Yes    | No             |
-| **Fast**      | `v{upstream}-mongo.{N}-fast`                   | `v1.30.0-148.6-mongo.2-fast`      | No    | Yes    | No             |
+| Type         | Pattern                                    | Example                                  | Tests | Docker | GitHub Release |
+| ------------ | ------------------------------------------ | ---------------------------------------- | ----- | ------ | -------------- |
+| **Stable**   | `v{upstream}-mongo.{N}`                    | `v1.30.0-148.6-mongo.2`                  | Yes   | Yes    | Yes            |
+| **Datetime** | `v{upstream}-mongo.{N}-{YYYYMMDDTHHMMSSZ}` | `v1.30.0-148.6-mongo.2-20260301T140000Z` | Yes   | Yes    | No             |
+| **Fast**     | `v{upstream}-mongo.{N}-fast`               | `v1.30.0-148.6-mongo.2-fast`             | No    | Yes    | No             |
 
 - **Stable** tags are used for official releases. CI runs all tests and creates a GitHub Release.
 - **Datetime** tags are for development/CI builds that need full verification but no formal release.
@@ -118,11 +118,11 @@ git push tag v1.30.0-148.6-mongo.2
 
 When Docker images are published, `docker-build-push.yml` generates three tag tiers:
 
-| Tier       | Format                          | Example                    | Updates when…                          |
-| ---------- | ------------------------------- | -------------------------- | -------------------------------------- |
-| **Base**   | `{major.minor.patch}-mongo`     | `1.30.0-mongo`             | Major/minor/patch changes (acts as "latest" for version) |
-| **Plugin** | `{upstream.patch}-mongo.{N}`    | `1.30.0-148.6-mongo.2`    | Cloud patch or plugin revision changes |
-| **Full**   | `{plugin}-{YYYYMMDDTHHMMSSZ}`  | `1.30.0-148.6-mongo.2-20260301T140000Z` | Every build (unique per build)  |
+| Tier       | Format                        | Example                                 | Updates when…                                            |
+| ---------- | ----------------------------- | --------------------------------------- | -------------------------------------------------------- |
+| **Base**   | `{major.minor.patch}-mongo`   | `1.30.0-mongo`                          | Major/minor/patch changes (acts as "latest" for version) |
+| **Plugin** | `{upstream.patch}-mongo.{N}`  | `1.30.0-148.6-mongo.2`                  | Cloud patch or plugin revision changes                   |
+| **Full**   | `{plugin}-{YYYYMMDDTHHMMSSZ}` | `1.30.0-148.6-mongo.2-20260301T140000Z` | Every build (unique per build)                           |
 
 For stable tags without a timestamp suffix, Plugin and Full tags are identical.
 
@@ -156,6 +156,7 @@ git push origin v1.30.0-148.6-mongo.2
 
 > **Tip:** Use `-fast` suffix for a quick Docker-only build when you've already
 > verified tests locally:
+>
 > ```bash
 > git tag v1.30.0-148.6-mongo.2-fast
 > git push origin v1.30.0-148.6-mongo.2-fast
@@ -409,9 +410,9 @@ to a new upstream tag. Replace `{PLACEHOLDER}` values.
 
 ## Version History
 
-| Date       | Base Tag        | Branch                    | Release Tag                | Notes                                                |
-| ---------- | --------------- | ------------------------- | -------------------------- | ---------------------------------------------------- |
-| 2026-01-16 | v1.30.0-148.2   | feature/mongodb-plugin    | —                          | First rebase; learned go.mod conflict resolution     |
-| 2026-01-19 | v1.30.0-148.3   | mongo/v1.30.0-148.3-dev   | v1.30.0-148.3-mongo.1      | Second rebase; established naming conventions        |
-| 2026-03-01 | v1.30.0-148.6   | mongo/v1.30.0-148.6-dev   | v1.30.0-148.6-mongo.2      | Third rebase; zero conflicts (small delta from 148.3)|
-| TBD        | v1.31.0-151.5   | mongo/v1.31.0-151.5-dev   | —                          | Cross-minor bump (v1.30 → v1.31); deferred           |
+| Date       | Base Tag      | Branch                  | Release Tag           | Notes                                                 |
+| ---------- | ------------- | ----------------------- | --------------------- | ----------------------------------------------------- |
+| 2026-01-16 | v1.30.0-148.2 | feature/mongodb-plugin  | —                     | First rebase; learned go.mod conflict resolution      |
+| 2026-01-19 | v1.30.0-148.3 | mongo/v1.30.0-148.3-dev | v1.30.0-148.3-mongo.1 | Second rebase; established naming conventions         |
+| 2026-03-01 | v1.30.0-148.6 | mongo/v1.30.0-148.6-dev | v1.30.0-148.6-mongo.2 | Third rebase; zero conflicts (small delta from 148.3) |
+| TBD        | v1.31.0-151.5 | mongo/v1.31.0-151.5-dev | —                     | Cross-minor bump (v1.30 → v1.31); deferred            |
