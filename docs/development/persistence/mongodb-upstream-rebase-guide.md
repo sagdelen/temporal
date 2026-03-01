@@ -10,6 +10,11 @@
   - [Background](#background)
   - [Prerequisites](#prerequisites)
   - [Naming Conventions](#naming-conventions)
+  - [CI/CD Tag System and Docker Publishing](#cicd-tag-system-and-docker-publishing)
+    - [Tag Types](#tag-types)
+    - [CI Pipeline Behavior](#ci-pipeline-behavior)
+    - [Docker Image Tags (3-Tier Strategy)](#docker-image-tags-3-tier-strategy)
+    - [Release Workflow](#release-workflow)
   - [Procedure](#procedure)
     - [1. Identify Target Tag](#1-identify-target-tag)
     - [2. Create Branch](#2-create-branch)
@@ -72,6 +77,89 @@ Notes:
 - Tags with the `-fast` suffix indicate CI builds that only ran MongoDB-specific tests.
 - Upstream tags may include **major/minor version bumps** (e.g., `v1.30.0` → `v1.31.0`). The procedure
   handles this transparently — the branch/tag naming always mirrors the upstream tag verbatim.
+
+## CI/CD Tag System and Docker Publishing
+
+> **Key takeaway:** Pushing a branch alone does NOT trigger CI. You must push a **git tag**
+> matching `v*-mongo.*` to trigger the release pipeline.
+
+### Tag Types
+
+The `tag-release.yml` workflow recognizes three tag patterns, all matching the glob `v*-mongo.*`:
+
+| Type          | Pattern                                       | Example                            | Tests | Docker | GitHub Release |
+| ------------- | --------------------------------------------- | ---------------------------------- | ----- | ------ | -------------- |
+| **Stable**    | `v{upstream}-mongo.{N}`                        | `v1.30.0-148.6-mongo.2`           | Yes   | Yes    | Yes            |
+| **Datetime**  | `v{upstream}-mongo.{N}-{YYYYMMDDTHHMMSSZ}`    | `v1.30.0-148.6-mongo.2-20260301T140000Z` | Yes   | Yes    | No             |
+| **Fast**      | `v{upstream}-mongo.{N}-fast`                   | `v1.30.0-148.6-mongo.2-fast`      | No    | Yes    | No             |
+
+- **Stable** tags are used for official releases. CI runs all tests and creates a GitHub Release.
+- **Datetime** tags are for development/CI builds that need full verification but no formal release.
+- **Fast** tags skip tests entirely — useful for quickly pushing a Docker image when tests were already validated locally.
+
+### CI Pipeline Behavior
+
+```
+git push tag v1.30.0-148.6-mongo.2
+       │
+       ▼
+  tag-release.yml (triggered by v*-mongo.*)
+       │
+       ├── determine (classify tag type)
+       │
+       ├── tests (run-tests.yml) ← skipped for -fast tags
+       │
+       ├── docker (docker-build-push.yml) ← always runs
+       │
+       └── release (GitHub Release) ← only for stable tags
+```
+
+### Docker Image Tags (3-Tier Strategy)
+
+When Docker images are published, `docker-build-push.yml` generates three tag tiers:
+
+| Tier       | Format                          | Example                    | Updates when…                          |
+| ---------- | ------------------------------- | -------------------------- | -------------------------------------- |
+| **Base**   | `{major.minor.patch}-mongo`     | `1.30.0-mongo`             | Major/minor/patch changes (acts as "latest" for version) |
+| **Plugin** | `{upstream.patch}-mongo.{N}`    | `1.30.0-148.6-mongo.2`    | Cloud patch or plugin revision changes |
+| **Full**   | `{plugin}-{YYYYMMDDTHHMMSSZ}`  | `1.30.0-148.6-mongo.2-20260301T140000Z` | Every build (unique per build)  |
+
+For stable tags without a timestamp suffix, Plugin and Full tags are identical.
+
+**Docker Hub repository:** `agdelen/temporal`
+
+```bash
+# Pull by stable plugin tag (recommended for production)
+docker pull agdelen/temporal:1.30.0-148.6-mongo.2
+
+# Pull latest for v1.30
+docker pull agdelen/temporal:1.30.0-mongo
+```
+
+### Release Workflow
+
+After verification is complete on the `-dev` branch:
+
+```bash
+# 1. Push the branch (no CI triggered — just for remote backup)
+git push origin mongo/v1.30.0-148.6-dev
+
+# 2. Create and push the release tag (this triggers CI)
+git tag v1.30.0-148.6-mongo.2
+git push origin v1.30.0-148.6-mongo.2
+
+# 3. CI automatically:
+#    - Runs all tests (run-tests.yml)
+#    - Builds & pushes Docker image with 3-tier tags
+#    - Creates GitHub Release (for stable tags)
+```
+
+> **Tip:** Use `-fast` suffix for a quick Docker-only build when you've already
+> verified tests locally:
+> ```bash
+> git tag v1.30.0-148.6-mongo.2-fast
+> git push origin v1.30.0-148.6-mongo.2-fast
+> ```
 
 ## Procedure
 
@@ -321,8 +409,9 @@ to a new upstream tag. Replace `{PLACEHOLDER}` values.
 
 ## Version History
 
-| Date       | Base Tag      | Branch                  | Notes                                                |
-| ---------- | ------------- | ----------------------- | ---------------------------------------------------- |
-| 2026-01-16 | v1.30.0-148.2 | feature/mongodb-plugin  | First rebase; learned go.mod conflict resolution     |
-| 2026-01-19 | v1.30.0-148.3 | mongo/v1.30.0-148.3-dev | Second rebase; established naming conventions        |
-| 2026-03-xx | v1.31.0-151.5 | mongo/v1.31.0-151.5-dev | Third rebase; first cross-minor bump (v1.30 → v1.31) |
+| Date       | Base Tag        | Branch                    | Release Tag                | Notes                                                |
+| ---------- | --------------- | ------------------------- | -------------------------- | ---------------------------------------------------- |
+| 2026-01-16 | v1.30.0-148.2   | feature/mongodb-plugin    | —                          | First rebase; learned go.mod conflict resolution     |
+| 2026-01-19 | v1.30.0-148.3   | mongo/v1.30.0-148.3-dev   | v1.30.0-148.3-mongo.1      | Second rebase; established naming conventions        |
+| 2026-03-01 | v1.30.0-148.6   | mongo/v1.30.0-148.6-dev   | v1.30.0-148.6-mongo.2      | Third rebase; zero conflicts (small delta from 148.3)|
+| TBD        | v1.31.0-151.5   | mongo/v1.31.0-151.5-dev   | —                          | Cross-minor bump (v1.30 → v1.31); deferred           |
