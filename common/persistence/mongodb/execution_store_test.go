@@ -15,6 +15,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
@@ -195,7 +196,7 @@ func TestUpdateWorkflowExecution_ContinueAsNew(t *testing.T) {
 	}
 
 	currentDoc := &currentExecutionDocument{
-		ID:               currentExecutionDocID(nsID, wfID),
+		ID:               currentExecutionDocID(nsID, wfID, chasm.UnspecifiedArchetypeID),
 		ShardID:          1,
 		NamespaceID:      nsID,
 		WorkflowID:       wfID,
@@ -335,7 +336,7 @@ func TestGetCurrentExecution_Success(t *testing.T) {
 	currCol := newFakeCollection(t)
 	now := time.Now().UTC()
 	doc := &currentExecutionDocument{
-		ID:              currentExecutionDocID(nsID, wfID),
+		ID:              currentExecutionDocID(nsID, wfID, chasm.UnspecifiedArchetypeID),
 		NamespaceID:     nsID,
 		WorkflowID:      wfID,
 		RunID:           runID,

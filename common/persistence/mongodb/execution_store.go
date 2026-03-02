@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
@@ -178,6 +179,7 @@ type (
 		NamespaceID      string     `bson:"namespace_id"`
 		WorkflowID       string     `bson:"workflow_id"`
 		RunID            string     `bson:"run_id"`
+		ArchetypeID      uint32     `bson:"archetype_id"`
 		CreateRequestID  string     `bson:"create_request_id,omitempty"`
 		State            int32      `bson:"state"`
 		Status           int32      `bson:"status"`
@@ -190,6 +192,7 @@ type (
 	currentExecutionWriteConflictError struct {
 		namespaceID string
 		workflowID  string
+		archetypeID chasm.ArchetypeID
 		message     string
 	}
 )
@@ -268,8 +271,11 @@ func executionDocID(namespaceID, workflowID, runID string) string {
 	return fmt.Sprintf("%s|%s|%s", namespaceID, workflowID, runID)
 }
 
-func currentExecutionDocID(namespaceID, workflowID string) string {
-	return fmt.Sprintf("%s|%s", namespaceID, workflowID)
+func currentExecutionDocID(namespaceID, workflowID string, archetypeID chasm.ArchetypeID) string {
+	if archetypeID == chasm.UnspecifiedArchetypeID || archetypeID == chasm.WorkflowArchetypeID {
+		return fmt.Sprintf("%s|%s", namespaceID, workflowID)
+	}
+	return fmt.Sprintf("%s|%s|%d", namespaceID, workflowID, archetypeID)
 }
 
 func timePtrFromProto(ts *timestamppb.Timestamp) *time.Time {
@@ -1074,12 +1080,13 @@ func (s *executionStore) applyMutationToExecutionDocument(
 func (s *executionStore) updateCurrentExecutionForMutation(
 	ctx context.Context,
 	namespaceID, workflowID string,
+	archetypeID chasm.ArchetypeID,
 	state *persistencespb.WorkflowExecutionState,
 	lastWriteVersion int64,
 	dbRecordVersion int64,
 ) error {
 	filter := bson.M{
-		"_id":    currentExecutionDocID(namespaceID, workflowID),
+		"_id":    currentExecutionDocID(namespaceID, workflowID, archetypeID),
 		"run_id": state.GetRunId(),
 	}
 	set := bson.M{
@@ -1101,7 +1108,7 @@ func (s *executionStore) updateCurrentExecutionForMutation(
 		return serviceerror.NewUnavailablef("failed to update current execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		existing, loadErr := s.loadCurrentExecution(ctx, namespaceID, workflowID)
+		existing, loadErr := s.loadCurrentExecution(ctx, namespaceID, workflowID, archetypeID)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -1112,7 +1119,9 @@ func (s *executionStore) updateCurrentExecutionForMutation(
 
 func (s *executionStore) updateCurrentExecutionForConflict(
 	ctx context.Context,
-	namespaceID, workflowID, previousRunID string,
+	namespaceID, workflowID string,
+	archetypeID chasm.ArchetypeID,
+	previousRunID string,
 	newState *persistencespb.WorkflowExecutionState,
 	lastWriteVersion int64,
 	dbRecordVersion int64,
@@ -1122,7 +1131,7 @@ func (s *executionStore) updateCurrentExecutionForConflict(
 	}
 
 	filter := bson.M{
-		"_id":    currentExecutionDocID(namespaceID, workflowID),
+		"_id":    currentExecutionDocID(namespaceID, workflowID, archetypeID),
 		"run_id": previousRunID,
 	}
 
@@ -1146,7 +1155,7 @@ func (s *executionStore) updateCurrentExecutionForConflict(
 		return serviceerror.NewUnavailablef("failed to update current execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		existing, loadErr := s.loadCurrentExecution(ctx, namespaceID, workflowID)
+		existing, loadErr := s.loadCurrentExecution(ctx, namespaceID, workflowID, archetypeID)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -1159,16 +1168,17 @@ func (s *executionStore) updateCurrentExecutionForConflict(
 func (s *executionStore) updateCurrentExecutionForSnapshot(
 	ctx context.Context,
 	namespaceID, workflowID string,
+	archetypeID chasm.ArchetypeID,
 	snapshot *persistence.InternalWorkflowSnapshot,
 ) error {
 	if snapshot == nil || snapshot.ExecutionState == nil {
 		return serviceerror.NewInvalidArgument("conflict resolve snapshot missing execution state")
 	}
-	return s.updateCurrentExecutionForMutation(ctx, namespaceID, workflowID, snapshot.ExecutionState, snapshot.LastWriteVersion, snapshot.DBRecordVersion)
+	return s.updateCurrentExecutionForMutation(ctx, namespaceID, workflowID, archetypeID, snapshot.ExecutionState, snapshot.LastWriteVersion, snapshot.DBRecordVersion)
 }
 
-func (s *executionStore) assertNotCurrentExecution(ctx context.Context, namespaceID, workflowID, runID string) error {
-	current, err := s.loadCurrentExecution(ctx, namespaceID, workflowID)
+func (s *executionStore) assertNotCurrentExecution(ctx context.Context, namespaceID, workflowID string, archetypeID chasm.ArchetypeID, runID string) error {
+	current, err := s.loadCurrentExecution(ctx, namespaceID, workflowID, archetypeID)
 	if err != nil {
 		return err
 	}
@@ -1272,7 +1282,7 @@ func (s *executionStore) applyUpdateWorkflowExecution(
 	// For UpdateCurrent, fail fast on current-run mismatch even if the target execution doesn't exist.
 	// This matches the cross-store contract tested in TestUpdate_NotZombie_CurrentConflict.
 	if request.Mode == persistence.UpdateWorkflowModeUpdateCurrent {
-		current, err := s.loadCurrentExecution(ctx, mutation.NamespaceID, mutation.WorkflowID)
+		current, err := s.loadCurrentExecution(ctx, mutation.NamespaceID, mutation.WorkflowID, request.ArchetypeID)
 		if err != nil {
 			return err
 		}
@@ -1316,7 +1326,7 @@ func (s *executionStore) applyUpdateWorkflowExecution(
 	case persistence.UpdateWorkflowModeIgnoreCurrent:
 		// no-op
 	case persistence.UpdateWorkflowModeBypassCurrent:
-		if err := s.assertNotCurrentExecution(ctx, mutation.NamespaceID, mutation.WorkflowID, stateProto.GetRunId()); err != nil {
+		if err := s.assertNotCurrentExecution(ctx, mutation.NamespaceID, mutation.WorkflowID, request.ArchetypeID, stateProto.GetRunId()); err != nil {
 			return err
 		}
 	case persistence.UpdateWorkflowModeUpdateCurrent:
@@ -1325,6 +1335,7 @@ func (s *executionStore) applyUpdateWorkflowExecution(
 				ctx,
 				mutation.NamespaceID,
 				mutation.WorkflowID,
+				request.ArchetypeID,
 				stateProto.GetRunId(),
 				newState,
 				request.NewWorkflowSnapshot.LastWriteVersion,
@@ -1333,7 +1344,7 @@ func (s *executionStore) applyUpdateWorkflowExecution(
 				return err
 			}
 		} else {
-			if err := s.updateCurrentExecutionForMutation(ctx, mutation.NamespaceID, mutation.WorkflowID, stateProto, mutation.LastWriteVersion, mutation.DBRecordVersion); err != nil {
+			if err := s.updateCurrentExecutionForMutation(ctx, mutation.NamespaceID, mutation.WorkflowID, request.ArchetypeID, stateProto, mutation.LastWriteVersion, mutation.DBRecordVersion); err != nil {
 				return err
 			}
 		}
@@ -1431,11 +1442,12 @@ func (s *executionStore) buildCurrentExecutionDocument(request *persistence.Inte
 		startTime = timePtrFromProto(state.StartTime)
 	}
 	return &currentExecutionDocument{
-		ID:               currentExecutionDocID(snapshot.NamespaceID, snapshot.WorkflowID),
+		ID:               currentExecutionDocID(snapshot.NamespaceID, snapshot.WorkflowID, request.ArchetypeID),
 		ShardID:          request.ShardID,
 		NamespaceID:      snapshot.NamespaceID,
 		WorkflowID:       snapshot.WorkflowID,
 		RunID:            state.GetRunId(),
+		ArchetypeID:      request.ArchetypeID,
 		CreateRequestID:  state.GetCreateRequestId(),
 		State:            int32(state.GetState()),
 		Status:           int32(state.GetStatus()),
@@ -1487,6 +1499,7 @@ func (s *executionStore) insertNewCurrentExecution(
 		return &currentExecutionWriteConflictError{
 			namespaceID: doc.NamespaceID,
 			workflowID:  doc.WorkflowID,
+			archetypeID: chasm.ArchetypeID(doc.ArchetypeID),
 			message:     message,
 		}
 	}
@@ -1532,7 +1545,7 @@ func (s *executionStore) updateExistingCurrentExecution(
 		return serviceerror.NewUnavailablef("failed to update current execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID)
+		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
 		if loadErr != nil {
 			return loadErr
 		}
@@ -1550,7 +1563,7 @@ func (s *executionStore) ensureRunIDMismatch(
 	if doc == nil {
 		return nil
 	}
-	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID)
+	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
 	if err != nil {
 		return err
 	}
@@ -1561,8 +1574,8 @@ func (s *executionStore) ensureRunIDMismatch(
 	return nil
 }
 
-func (s *executionStore) loadCurrentExecution(ctx context.Context, namespaceID, workflowID string) (*currentExecutionDocument, error) {
-	filter := bson.M{"_id": currentExecutionDocID(namespaceID, workflowID)}
+func (s *executionStore) loadCurrentExecution(ctx context.Context, namespaceID, workflowID string, archetypeID chasm.ArchetypeID) (*currentExecutionDocument, error) {
+	filter := bson.M{"_id": currentExecutionDocID(namespaceID, workflowID, archetypeID)}
 	var doc currentExecutionDocument
 	if err := s.currentExecsCol.FindOne(ctx, filter).Decode(&doc); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -1760,7 +1773,7 @@ func (s *executionStore) CreateWorkflowExecution(
 	if err != nil {
 		var conflictErr *currentExecutionWriteConflictError
 		if errors.As(err, &conflictErr) {
-			existing, loadErr := s.loadCurrentExecution(ctx, conflictErr.namespaceID, conflictErr.workflowID)
+			existing, loadErr := s.loadCurrentExecution(ctx, conflictErr.namespaceID, conflictErr.workflowID, conflictErr.archetypeID)
 			if loadErr != nil {
 				return nil, loadErr
 			}
@@ -1989,7 +2002,7 @@ func (s *executionStore) applyConflictResolveWorkflowExecution(
 
 	switch request.Mode {
 	case persistence.ConflictResolveWorkflowModeBypassCurrent:
-		if err := s.assertNotCurrentExecution(ctx, resetSnapshot.NamespaceID, resetSnapshot.WorkflowID, runID); err != nil {
+		if err := s.assertNotCurrentExecution(ctx, resetSnapshot.NamespaceID, resetSnapshot.WorkflowID, request.ArchetypeID, runID); err != nil {
 			return err
 		}
 	case persistence.ConflictResolveWorkflowModeUpdateCurrent:
@@ -2001,7 +2014,7 @@ func (s *executionStore) applyConflictResolveWorkflowExecution(
 			targetLastWriteVersion = request.NewWorkflowSnapshot.LastWriteVersion
 			targetDBRecordVersion = request.NewWorkflowSnapshot.DBRecordVersion
 		}
-		if err := s.updateCurrentExecutionForConflict(ctx, resetSnapshot.NamespaceID, resetSnapshot.WorkflowID, prevRunID, targetState, targetLastWriteVersion, targetDBRecordVersion); err != nil {
+		if err := s.updateCurrentExecutionForConflict(ctx, resetSnapshot.NamespaceID, resetSnapshot.WorkflowID, request.ArchetypeID, prevRunID, targetState, targetLastWriteVersion, targetDBRecordVersion); err != nil {
 			return err
 		}
 	default:
@@ -2047,7 +2060,7 @@ func (s *executionStore) DeleteCurrentWorkflowExecution(
 	}
 
 	filter := bson.M{
-		"_id":    currentExecutionDocID(request.NamespaceID, request.WorkflowID),
+		"_id":    currentExecutionDocID(request.NamespaceID, request.WorkflowID, request.ArchetypeID),
 		"run_id": request.RunID,
 	}
 	_, err := s.currentExecsCol.DeleteOne(ctx, filter)
@@ -2064,7 +2077,7 @@ func (s *executionStore) GetCurrentExecution(
 	if request == nil {
 		return nil, serviceerror.NewInvalidArgument("GetCurrentExecution request is nil")
 	}
-	doc, err := s.loadCurrentExecution(ctx, request.NamespaceID, request.WorkflowID)
+	doc, err := s.loadCurrentExecution(ctx, request.NamespaceID, request.WorkflowID, request.ArchetypeID)
 	if err != nil {
 		return nil, err
 	}
