@@ -1697,8 +1697,9 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 				Keys: bson.D{
 					{Key: "namespace_id", Value: 1},
 					{Key: "workflow_id", Value: 1},
+					{Key: "archetype_id", Value: 1},
 				},
-				Options: options.Index().SetName("current_executions_namespace_workflow").SetUnique(true),
+				Options: options.Index().SetName("current_executions_namespace_workflow_archetype").SetUnique(true),
 			},
 		},
 		{
@@ -1713,6 +1714,9 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 			},
 		},
 	}
+
+	// Drop legacy index that didn't include archetype_id, if it exists.
+	_ = idxView.DropOne(ctx, "current_executions_namespace_workflow")
 
 	for _, spec := range indexes {
 		if _, err := idxView.CreateOne(ctx, spec.model); err != nil && !isDuplicateIndexError(err) {
