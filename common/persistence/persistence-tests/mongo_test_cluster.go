@@ -64,6 +64,9 @@ func NewTestBaseWithMongoDB(opts *TestBaseOptions) *TestBase {
 		cfg = defaults.MongoDBConfig
 	}
 	cfgCopy := *cfg
+	if opts.DBName != "" {
+		cfgCopy.DatabaseName = opts.DBName
+	}
 	if cfgCopy.DatabaseName == "" {
 		cfgCopy.DatabaseName = "test_" + GenerateRandomDBName(4) + "_temporal_persistence"
 	}
@@ -109,6 +112,7 @@ func GetMongoDBTestClusterOption() *TestBaseOptions {
 	return &TestBaseOptions{
 		StoreType:         config.StoreTypeNoSQL,
 		NoSQLDBPluginName: "mongodb",
+		DBName:            cfg.DatabaseName,
 		MongoDBConfig:     cfg,
 	}
 }

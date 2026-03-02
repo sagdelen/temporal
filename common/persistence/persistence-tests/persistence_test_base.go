@@ -80,8 +80,9 @@ func (o *TestBaseOptions) ApplyDefaults(src *TestBaseOptions) {
 	if o.ConnectAttributes == nil {
 		o.ConnectAttributes = src.ConnectAttributes
 	}
-	if o.MongoDBConfig == nil {
-		o.MongoDBConfig = src.MongoDBConfig
+	if o.MongoDBConfig == nil && src.MongoDBConfig != nil {
+		cfgCopy := *src.MongoDBConfig
+		o.MongoDBConfig = &cfgCopy
 	}
 }
 
