@@ -70,6 +70,7 @@ type (
 func (o *TestBaseOptions) ApplyDefaults(src *TestBaseOptions) {
 	o.StoreType = cmp.Or(o.StoreType, src.StoreType)
 	o.SQLDBPluginName = cmp.Or(o.SQLDBPluginName, src.SQLDBPluginName)
+	o.NoSQLDBPluginName = cmp.Or(o.NoSQLDBPluginName, src.NoSQLDBPluginName)
 	o.DBName = cmp.Or(o.DBName, src.DBName)
 	o.DBUsername = cmp.Or(o.DBUsername, src.DBUsername)
 	o.DBPassword = cmp.Or(o.DBPassword, src.DBPassword)
@@ -78,6 +79,9 @@ func (o *TestBaseOptions) ApplyDefaults(src *TestBaseOptions) {
 	o.SchemaDir = cmp.Or(o.SchemaDir, src.SchemaDir)
 	if o.ConnectAttributes == nil {
 		o.ConnectAttributes = src.ConnectAttributes
+	}
+	if o.MongoDBConfig == nil {
+		o.MongoDBConfig = src.MongoDBConfig
 	}
 }
 
