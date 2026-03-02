@@ -47,7 +47,12 @@ func GetTestClusterOption(storeType, driver string) *TestBaseOptions {
 			panic(fmt.Sprintf("unknown sql driver: %v", driver))
 		}
 	case config.StoreTypeNoSQL:
-		return GetCassandraTestClusterOption()
+		switch driver {
+		case "mongodb":
+			return GetMongoDBTestClusterOption()
+		default:
+			return GetCassandraTestClusterOption()
+		}
 	default:
 		panic(fmt.Sprintf("unknown store type: %v", storeType))
 	}
