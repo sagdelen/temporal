@@ -774,6 +774,7 @@ func TestPutReplicationTaskToDLQ_Deduplicates(t *testing.T) {
 	replicationCol := newFakeCollection(t)
 	store := &executionStore{
 		replicationDLQCol: replicationCol,
+		serializer:        serialization.NewSerializer(),
 	}
 
 	taskInfo := &persistencespb.ReplicationTaskInfo{TaskId: 42}
