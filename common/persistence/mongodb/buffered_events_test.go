@@ -172,6 +172,7 @@ func (e *bufferedEventsEnv) storedType(t *testing.T, workflowID string) bsontype
 }
 
 // Each transaction sends only its own new batch; earlier batches must survive.
+// The store merges them into one blob, so the payloads read back joined.
 func TestBufferedEvents_AppendAcrossUpdates(t *testing.T) {
 	env := newBufferedEventsEnv(t)
 	const wf = "wf-append"
@@ -182,15 +183,15 @@ func TestBufferedEvents_AppendAcrossUpdates(t *testing.T) {
 	require.Equal(t, []string{"batch-1"}, env.buffered(t, wf))
 
 	env.update(t, wf, 3, bufferedBatch("batch-2"), false)
-	require.Equal(t, []string{"batch-1", "batch-2"}, env.buffered(t, wf),
+	require.Equal(t, []string{"batch-1batch-2"}, env.buffered(t, wf),
 		"the second buffered batch must be appended, not replace the first")
 
 	// A mutation that does not touch the buffer leaves it alone.
 	env.update(t, wf, 4, nil, false)
-	require.Equal(t, []string{"batch-1", "batch-2"}, env.buffered(t, wf))
+	require.Equal(t, []string{"batch-1batch-2"}, env.buffered(t, wf))
 
 	env.update(t, wf, 5, bufferedBatch("batch-3"), false)
-	require.Equal(t, []string{"batch-1", "batch-2", "batch-3"}, env.buffered(t, wf))
+	require.Equal(t, []string{"batch-1batch-2batch-3"}, env.buffered(t, wf))
 }
 
 func TestBufferedEvents_ClearEmptiesBuffer(t *testing.T) {
@@ -241,12 +242,12 @@ func TestBufferedEvents_LegacySingleBlobDocument(t *testing.T) {
 	require.Equal(t, []string{"legacy"}, env.buffered(t, wf))
 
 	env.update(t, wf, 2, bufferedBatch("batch-2"), false)
-	require.Equal(t, []string{"legacy", "batch-2"}, env.buffered(t, wf))
+	require.Equal(t, []string{"legacybatch-2"}, env.buffered(t, wf))
 }
 
-// A single buffered batch keeps the pre-fix on-disk shape (one sub-document),
-// so servers that have not been upgraded yet can still read it. Only two or
-// more batches, which those servers could not represent, are stored as an array.
+// The buffer keeps the pre-fix on-disk shape (one sub-document) however many
+// batches were appended, so servers that have not been upgraded, or that were
+// rolled back, can still read it.
 func TestBufferedEvents_StoredShape(t *testing.T) {
 	env := newBufferedEventsEnv(t)
 	const wf = "wf-shape"
@@ -256,9 +257,12 @@ func TestBufferedEvents_StoredShape(t *testing.T) {
 	require.Equal(t, bsontype.EmbeddedDocument, env.storedType(t, wf))
 
 	env.update(t, wf, 3, bufferedBatch("batch-2"), false)
-	require.Equal(t, bsontype.Array, env.storedType(t, wf))
+	require.Equal(t, bsontype.EmbeddedDocument, env.storedType(t, wf))
 
-	env.update(t, wf, 4, nil, true)
+	env.update(t, wf, 4, bufferedBatch("batch-3"), false)
+	require.Equal(t, bsontype.EmbeddedDocument, env.storedType(t, wf))
+
+	env.update(t, wf, 5, nil, true)
 	stored := env.storedType(t, wf)
 	require.Truef(t, stored == bsontype.Null || stored == bsontype.Type(0),
 		"cleared buffer should be stored as null or absent, got %v", stored)
