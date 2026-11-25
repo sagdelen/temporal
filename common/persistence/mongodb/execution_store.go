@@ -279,12 +279,14 @@ func timePtrFromProto(ts *timestamppb.Timestamp) *time.Time {
 // bufferedBatches holds the buffered event batches of an execution in the
 // order they were buffered.
 //
-// On disk a single batch is stored as one blob sub-document and two or more
-// batches as an array of them. The single-batch form is what the store wrote
-// when it could only hold one batch, so documents written before batches were
-// appended stay readable, and servers that have not been upgraded can still
-// read every document they could have written themselves. An empty buffer is
-// stored as null.
+// The store keeps the whole buffer as one blob sub-document, which is the
+// shape it has always written: a new batch is merged into the stored one (see
+// appendBufferedBatch), so servers that have not been upgraded, or that were
+// rolled back, can read every document. An empty buffer is stored as null.
+//
+// Batches that cannot be merged are stored as an array of blobs. That cannot
+// happen with the encodings Temporal writes today; the form exists so that
+// such a batch is kept instead of dropped.
 type bufferedBatches []dataBlobDoc
 
 // MarshalBSONValue implements bson.ValueMarshaler.
@@ -322,6 +324,26 @@ func (b *bufferedBatches) UnmarshalBSONValue(t bsontype.Type, data []byte) error
 	default:
 		return fmt.Errorf("unexpected BSON type %v for buffered_events", t)
 	}
+}
+
+// appendBufferedBatch adds a newly buffered batch to the buffer.
+//
+// A batch is a serialized historypb.History message. Protobuf defines the
+// concatenation of two serialized messages as their merge, and merging appends
+// repeated fields, so the bytes of two proto3 batches joined together decode
+// as one batch holding the events of both in order. The buffer therefore stays
+// a single blob. A batch in any other encoding is kept as a separate entry.
+func appendBufferedBatch(batches bufferedBatches, batch dataBlobDoc) bufferedBatches {
+	proto3 := enumspb.ENCODING_TYPE_PROTO3.String()
+	if n := len(batches); n > 0 && batches[n-1].Encoding == proto3 && batch.Encoding == proto3 {
+		last := batches[n-1]
+		merged := make([]byte, 0, len(last.Data)+len(batch.Data))
+		merged = append(merged, last.Data...)
+		merged = append(merged, batch.Data...)
+		batches[n-1] = dataBlobDoc{Data: merged, Encoding: proto3}
+		return batches
+	}
+	return append(batches, batch)
 }
 
 func dataBlobToDoc(blob *commonpb.DataBlob) *dataBlobDoc {
@@ -1102,14 +1124,14 @@ func (s *executionStore) applyMutationToExecutionDocument(
 
 	// Buffered events.
 	// Buffered events are append-only between flushes: a mutation carries only
-	// its own new batch and the batches buffered by earlier transactions must be
+	// its own new batch and the events buffered by earlier transactions must be
 	// kept. Clearing first and appending afterwards matches the SQL stores, which
 	// delete the buffered rows and then insert the new batch.
 	if mutation.ClearBufferedEvents {
 		doc.BufferedEvents = nil
 	}
 	if newBatch := dataBlobToDoc(mutation.NewBufferedEvents); newBatch != nil {
-		doc.BufferedEvents = append(doc.BufferedEvents, *newBatch)
+		doc.BufferedEvents = appendBufferedBatch(doc.BufferedEvents, *newBatch)
 	}
 
 	// Tasks (best effort only tracked for observability in this stub).
