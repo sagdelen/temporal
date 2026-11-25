@@ -615,6 +615,16 @@ func (s *executionStore) tryInsertHistoryTaskDoc(
 	return false, nil
 }
 
+// insertWorkflowTasks writes the history tasks of a workflow transaction and
+// must be called inside that transaction.
+//
+// A task key that already exists fails the transaction, as it does in the SQL
+// stores. It must not be ignored: a duplicate key error aborts a MongoDB
+// transaction, so every later operation and the commit would fail with
+// NoSuchTransaction, which the driver treats as transient and retries until
+// its time limit. Task IDs are allocated per shard owner, so a collision means
+// another owner wrote into the same range; Unavailable makes the shard renew
+// its range before the write is attempted again.
 func (s *executionStore) insertWorkflowTasks(
 	ctx context.Context,
 	shardID int32,
@@ -635,8 +645,15 @@ func (s *executionStore) insertWorkflowTasks(
 		}
 
 		for _, task := range taskList {
-			if err := s.insertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task); err != nil {
+			duplicate, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
+			if err != nil {
 				return err
+			}
+			if duplicate {
+				return serviceerror.NewUnavailablef(
+					"history task already exists. shard: %v, category: %v, task key: %v",
+					shardID, categoryID, task.Key,
+				)
 			}
 		}
 	}
