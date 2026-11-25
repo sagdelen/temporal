@@ -832,30 +832,46 @@ type (
 		mu       sync.Mutex
 		failures int
 		err      error
+		// onlyCollection limits the failures to one collection when set.
+		onlyCollection string
+		// builds counts the index builds requested per collection.
+		builds map[string]int
 	}
 
 	failingIndexCollection struct {
 		client.Collection
-		db *failingIndexDatabase
+		db   *failingIndexDatabase
+		name string
 	}
 
 	failingIndexView struct {
 		client.IndexView
-		db *failingIndexDatabase
+		db         *failingIndexDatabase
+		collection string
 	}
 )
 
 func (d *failingIndexDatabase) Collection(name string) client.Collection {
-	return &failingIndexCollection{Collection: d.Database.Collection(name), db: d}
+	return &failingIndexCollection{Collection: d.Database.Collection(name), db: d, name: name}
 }
 
 func (c *failingIndexCollection) Indexes() client.IndexView {
-	return &failingIndexView{IndexView: c.Collection.Indexes(), db: c.db}
+	return &failingIndexView{IndexView: c.Collection.Indexes(), db: c.db, collection: c.name}
+}
+
+func (d *failingIndexDatabase) buildCount(collection string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.builds[collection]
 }
 
 func (v *failingIndexView) CreateOne(ctx context.Context, model mongo.IndexModel, opts ...*options.CreateIndexesOptions) (string, error) {
 	v.db.mu.Lock()
-	fail := v.db.failures > 0
+	if v.db.builds == nil {
+		v.db.builds = map[string]int{}
+	}
+	v.db.builds[v.collection]++
+	fail := v.db.failures > 0 && (v.db.onlyCollection == "" || v.db.onlyCollection == v.collection)
 	if fail {
 		v.db.failures--
 	}
@@ -1005,4 +1021,151 @@ func TestIndexMigration_DisabledOnlyReportsMissingIndexes(t *testing.T) {
 	// Once the operator has built the indexes, nothing is reported.
 	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
 	require.Empty(t, mongodb.ReportIndexMigrationForTest(testCtx(t), env.raw, env.logger, migration))
+}
+
+// An index blocked by duplicate data must not stop the servers from retrying
+// another index of the same migration that failed with a transient error, and
+// the blocked index must not be built (and its collection scanned) again on
+// those retries.
+func TestIndexMigration_DuplicateDataDoesNotBlockTransientRetry(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	ctx := testCtx(t)
+
+	dup := env.raw.Collection("coll_dup")
+	_, err := dup.InsertOne(ctx, bson.M{"_id": 1, "a": 1, "b": 1})
+	require.NoError(t, err)
+	_, err = dup.InsertOne(ctx, bson.M{"_id": 2, "a": 1, "b": 1})
+	require.NoError(t, err)
+
+	db := &failingIndexDatabase{Database: env.raw, failures: 3, err: notWritablePrimary, onlyCollection: "coll_flaky"}
+	migration := mongodb.IndexMigrationForTest{ID: "mixed", Indexes: []mongodb.IndexDefinitionForTest{
+		{Collection: "coll_dup", Name: "wanted", Keys: abKeys, Unique: true},
+		{Collection: "coll_flaky", Name: "wanted", Keys: abKeys},
+	}}
+	opts := mongodb.IndexMigrationOptionsForTest{
+		BuildAttempts:      3,
+		BuildRetryInterval: 10 * time.Millisecond,
+		RetryBackoff:       noBackoff(),
+	}
+
+	require.Equal(t, "completed_with_errors", mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, opts))
+	doc := env.record(t, "mixed")
+	require.Equal(t, "duplicate_data", doc.Indexes[0].Outcome)
+	require.Equal(t, "failed", doc.Indexes[1].Outcome)
+	require.False(t, doc.NeedsOperator, "a transient failure is left: the servers must retry the migration")
+	require.Equal(t, 1, db.buildCount("coll_dup"))
+
+	// The retry builds the index that failed transiently and leaves the
+	// blocked one alone. Nothing a retry can fix is left afterwards.
+	require.Equal(t, "completed_with_errors", mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, opts))
+	require.Contains(t, env.indexes(t, "coll_flaky"), "wanted")
+	require.Equal(t, 1, db.buildCount("coll_dup"), "the unique build over duplicates must not be repeated")
+	doc = env.record(t, "mixed")
+	require.Equal(t, "duplicate_data", doc.Indexes[0].Outcome)
+	require.Contains(t, doc.Indexes[0].Error, "E11000")
+	require.Equal(t, "created", doc.Indexes[1].Outcome)
+	require.True(t, doc.NeedsOperator)
+
+	require.Equal(t, "blocked_needs_operator", mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, opts))
+	require.Equal(t, 1, db.buildCount("coll_dup"))
+}
+
+// blockingIndexDatabase holds every index build until its context ends.
+type (
+	blockingIndexDatabase struct {
+		client.Database
+		started   chan struct{}
+		cancelled chan struct{}
+	}
+
+	blockingIndexCollection struct {
+		client.Collection
+		db *blockingIndexDatabase
+	}
+
+	blockingIndexView struct {
+		client.IndexView
+		db *blockingIndexDatabase
+	}
+)
+
+func (d *blockingIndexDatabase) Collection(name string) client.Collection {
+	if name == mongodb.SchemaMigrationsCollectionForTest {
+		return d.Database.Collection(name)
+	}
+	return &blockingIndexCollection{Collection: d.Database.Collection(name), db: d}
+}
+
+func (c *blockingIndexCollection) Indexes() client.IndexView {
+	return &blockingIndexView{IndexView: c.Collection.Indexes(), db: c.db}
+}
+
+func (v *blockingIndexView) CreateOne(ctx context.Context, _ mongo.IndexModel, _ ...*options.CreateIndexesOptions) (string, error) {
+	close(v.db.started)
+	<-ctx.Done()
+	close(v.db.cancelled)
+	return "", ctx.Err()
+}
+
+// A runner whose lease was taken over while it was building stops building,
+// records nothing and does not report the migration as completed: the new
+// owner is the one working on it.
+func TestIndexMigration_RunnerStopsWhenLeaseIsLost(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	db := &blockingIndexDatabase{Database: env.raw, started: make(chan struct{}), cancelled: make(chan struct{})}
+	migration := oneIndexMigration("stolen", mongodb.IndexDefinitionForTest{Collection: "coll", Name: "wanted", Keys: abKeys})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	outcome := make(chan string, 1)
+	go func() {
+		outcome <- mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, mongodb.IndexMigrationOptionsForTest{
+			Owner:     "first",
+			Heartbeat: 50 * time.Millisecond,
+			Poll:      100 * time.Millisecond,
+		})
+	}()
+
+	select {
+	case <-db.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the index build did not start")
+	}
+
+	// Another process takes the lease over, as it would after this runner
+	// failed to renew it in time.
+	res, err := env.raw.Collection(mongodb.SchemaMigrationsCollectionForTest).UpdateOne(testCtx(t),
+		bson.M{"_id": "stolen"},
+		bson.M{"$set": bson.M{"owner": "thief", "lease_until": time.Now().UTC().Add(time.Hour)}})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, res.MatchedCount)
+
+	select {
+	case <-db.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner kept building after it lost its lease")
+	}
+
+	// The runner goes back to waiting for the new owner; it ends with its context.
+	cancel()
+	require.Equal(t, "interrupted", <-outcome)
+
+	doc := env.record(t, "stolen")
+	require.Equal(t, "thief", doc.Owner)
+	require.Equal(t, "running", doc.Status)
+	require.Empty(t, doc.Indexes)
+	require.Equal(t, 1, env.logger.count(&env.logger.warns, "MongoDB index migration lost its lease"))
+	require.Zero(t, env.logger.count(&env.logger.infos, "MongoDB index migration completed"))
+}
+
+func TestIndexMigration_RetryableBuildErrors(t *testing.T) {
+	retryable := []int32{6, 7, 24, 89, 91, 112, 189, 262, 276, 285, 9001, 10107, 11600, 11601, 11602, 13435, 13436}
+	for _, code := range retryable {
+		require.Truef(t, mongodb.IsRetryableIndexBuildErrorForTest(mongo.CommandError{Code: code}), "code %d", code)
+	}
+	// Errors another attempt runs into again.
+	permanent := []int32{13, 67, 85, 86, 11000}
+	for _, code := range permanent {
+		require.Falsef(t, mongodb.IsRetryableIndexBuildErrorForTest(mongo.CommandError{Code: code}), "code %d", code)
+	}
 }

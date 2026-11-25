@@ -38,7 +38,8 @@ After it starts, a server builds the indexes that are missing in the background 
 
 - `status: "completed"`: every index is in place. The server logs `MongoDB index migration completed`.
 - `status: "completed_with_errors"`: at least one index is missing; `indexes[].outcome` and `indexes[].error` say which and why. Transient errors are retried by the servers after a backoff.
-- `needs_operator: true`: a unique index could not be built because the collection contains duplicates. This is not retried on its own. Fix the data, delete the migration's document from `schema_migrations`, and restart a server.
+- `indexes[].outcome: "duplicate_data"`: a unique index could not be built because the collection contains duplicates. That index is not built again on its own. Fix the data, delete the migration's document from `schema_migrations`, and restart a server.
+- `needs_operator: true`: duplicate data is the only thing left to fix, so the servers have stopped retrying the migration.
 
 Indexes that already exist with the same definition, for example after running `init.js`, are accepted and not built again.
 
