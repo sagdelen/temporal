@@ -25,6 +25,12 @@ type (
 		Heartbeat    time.Duration
 		Poll         time.Duration
 		RetryBackoff *time.Duration
+		// BuildAttempts and BuildRetryInterval control the retries of one
+		// index after a transient error.
+		BuildAttempts      int
+		BuildRetryInterval time.Duration
+		// ServerVersion replaces the version read from the server.
+		ServerVersion []int
 	}
 )
 
@@ -64,7 +70,27 @@ func RunIndexMigrationForTest(
 	if opts.RetryBackoff != nil {
 		m.retryBackoff = *opts.RetryBackoff
 	}
+	if opts.BuildAttempts > 0 {
+		m.buildAttempts = opts.BuildAttempts
+	}
+	if opts.BuildRetryInterval > 0 {
+		m.buildRetryInterval = opts.BuildRetryInterval
+	}
+	if opts.ServerVersion != nil {
+		m.serverVersion = opts.ServerVersion
+	}
 	return string(m.run(ctx, migration))
+}
+
+// ReportIndexMigrationForTest returns the indexes a server with index
+// migrations disabled reports as missing.
+func ReportIndexMigrationForTest(
+	ctx context.Context,
+	db client.Database,
+	logger log.Logger,
+	migration IndexMigrationForTest,
+) []string {
+	return newIndexMigrator(db, logger).report(ctx, migration)
 }
 
 // HistoryNodeQueryForTest returns the filter and sort ReadHistoryBranch uses.

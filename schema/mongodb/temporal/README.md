@@ -32,6 +32,18 @@ mongosh "$MONGO_URI" schema/mongodb/temporal/versioned/v1.0/init.js
 > **Note**
 > The scripts do not drop or mutate existing collections. They create collections and indexes when missing, so they are safe to rerun. The only indexes they drop are the ones an earlier version of the script created by mistake (listed as `obsoleteIndexes` in `init.js`). A script exits with a non-zero status when an index could not be created, for example a unique index over data that contains duplicates.
 
+## Index migrations
+
+After it starts, a server builds the indexes that are missing in the background and records the outcome in the `schema_migrations` collection, one document per migration:
+
+- `status: "completed"`: every index is in place. The server logs `MongoDB index migration completed`.
+- `status: "completed_with_errors"`: at least one index is missing; `indexes[].outcome` and `indexes[].error` say which and why. Transient errors are retried by the servers after a backoff.
+- `needs_operator: true`: a unique index could not be built because the collection contains duplicates. This is not retried on its own. Fix the data, delete the migration's document from `schema_migrations`, and restart a server.
+
+Indexes that already exist with the same definition, for example after running `init.js`, are accepted and not built again.
+
+To keep servers from building indexes at all, set `disableIndexMigration: true` in the MongoDB datastore config (`MONGODB_DISABLE_INDEX_MIGRATION=true` with the Docker config template). A server then only logs which indexes are missing, and `init.js` is the way to build them.
+
 ## Next Steps
 
 - Extend `init.js` as new collections or indexes are introduced. An index added to an index migration in the Go code must be added to `init.js` as well; `TestIndexMigration_InitScriptListsMigrationIndexes` checks this.

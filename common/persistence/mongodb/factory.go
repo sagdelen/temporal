@@ -83,7 +83,8 @@ func NewFactory(
 
 // startIndexMigration runs an index migration in the background, once per
 // factory. It never blocks or fails the caller: the outcome is logged and
-// recorded in the schema_migrations collection.
+// recorded in the schema_migrations collection. When index migrations are
+// disabled in the config it only reports the missing indexes.
 func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration) {
 	if f.migrationCtx == nil {
 		return
@@ -92,7 +93,12 @@ func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration)
 		f.migrationWG.Add(1)
 		go func() {
 			defer f.migrationWG.Done()
-			newIndexMigrator(f.database, f.logger).run(f.migrationCtx, migration)
+			migrator := newIndexMigrator(f.database, f.logger)
+			if f.cfg.DisableIndexMigration {
+				migrator.report(f.migrationCtx, migration)
+				return
+			}
+			migrator.run(f.migrationCtx, migration)
 		}()
 	})
 }

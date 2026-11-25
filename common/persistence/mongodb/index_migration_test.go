@@ -311,8 +311,8 @@ func TestIndexMigration_ReplacesNonUniqueIndex(t *testing.T) {
 
 // A unique index over duplicate data is not created: the failure is logged
 // and recorded, the index it should replace stays, and the other indexes of
-// the migration are still created. After the data is fixed the migration
-// completes, but not before the retry backoff has passed.
+// the migration are still created. The migration is then blocked until an
+// operator fixes the data and deletes its record.
 func TestIndexMigration_DuplicateDataBlocksOnlyThatIndex(t *testing.T) {
 	env := newIndexMigrationEnv(t)
 	ctx := testCtx(t)
@@ -343,15 +343,21 @@ func TestIndexMigration_DuplicateDataBlocksOnlyThatIndex(t *testing.T) {
 	require.Equal(t, 1, env.logger.count(&env.logger.errors, "MongoDB index migration finished with errors"))
 	require.Zero(t, env.logger.count(&env.logger.infos, "MongoDB index migration completed"))
 
-	// Within the backoff the failed build is not attempted again.
-	require.Equal(t, "skipped_after_errors", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.True(t, doc.NeedsOperator)
 
-	// Still failing after the backoff while the duplicates are there.
-	require.Equal(t, "completed_with_errors", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	// A unique build over duplicates scans the collection, so it is not
+	// attempted again on its own, not even after the retry backoff.
+	require.Equal(t, "blocked_needs_operator", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.Equal(t, "blocked_needs_operator", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	require.Equal(t, 2, env.logger.count(&env.logger.errors, "MongoDB index migration is blocked"))
 
+	// The operator fixes the data and deletes the record; the next run
+	// completes the migration.
 	_, err = dup.DeleteOne(ctx, bson.M{"_id": 2})
 	require.NoError(t, err)
-	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	_, err = env.raw.Collection(mongodb.SchemaMigrationsCollectionForTest).DeleteOne(ctx, bson.M{"_id": "duplicates"})
+	require.NoError(t, err)
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
 
 	indexes := env.indexes(t, "coll_dup")
 	require.True(t, indexes["wanted"].Unique)
@@ -817,4 +823,186 @@ func TestIndexMigration_HistoryReadsStayWithinRange(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failingIndexDatabase makes the first index builds fail with a given error.
+type (
+	failingIndexDatabase struct {
+		client.Database
+		mu       sync.Mutex
+		failures int
+		err      error
+	}
+
+	failingIndexCollection struct {
+		client.Collection
+		db *failingIndexDatabase
+	}
+
+	failingIndexView struct {
+		client.IndexView
+		db *failingIndexDatabase
+	}
+)
+
+func (d *failingIndexDatabase) Collection(name string) client.Collection {
+	return &failingIndexCollection{Collection: d.Database.Collection(name), db: d}
+}
+
+func (c *failingIndexCollection) Indexes() client.IndexView {
+	return &failingIndexView{IndexView: c.Collection.Indexes(), db: c.db}
+}
+
+func (v *failingIndexView) CreateOne(ctx context.Context, model mongo.IndexModel, opts ...*options.CreateIndexesOptions) (string, error) {
+	v.db.mu.Lock()
+	fail := v.db.failures > 0
+	if fail {
+		v.db.failures--
+	}
+	v.db.mu.Unlock()
+	if fail {
+		return "", v.db.err
+	}
+	return v.IndexView.CreateOne(ctx, model, opts...)
+}
+
+// notWritablePrimary is what a build gets when the primary steps down.
+var notWritablePrimary = mongo.CommandError{Code: 10107, Name: "NotWritablePrimary", Message: "not primary"}
+
+// A transient error is retried for the index at hand, so the migration still
+// completes in the same run.
+func TestIndexMigration_TransientErrorIsRetriedInProcess(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	db := &failingIndexDatabase{Database: env.raw, failures: 2, err: notWritablePrimary}
+	migration := oneIndexMigration("transient", mongodb.IndexDefinitionForTest{Collection: "coll", Name: "wanted", Keys: abKeys})
+
+	outcome := mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration,
+		mongodb.IndexMigrationOptionsForTest{BuildRetryInterval: 10 * time.Millisecond})
+
+	require.Equal(t, "completed", outcome)
+	require.Contains(t, env.indexes(t, "coll"), "wanted")
+	require.Equal(t, 2, env.logger.count(&env.logger.warns, "MongoDB index migration: transient error, retrying the index"))
+	require.Empty(t, env.logger.errors)
+}
+
+// When the transient error outlasts the retries of the index, the migration
+// ends with errors, waits for its backoff instead of giving up, and completes
+// on the next attempt without anyone restarting a server.
+func TestIndexMigration_TransientErrorIsRetriedAfterBackoff(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	db := &failingIndexDatabase{Database: env.raw, failures: 3, err: notWritablePrimary}
+	migration := oneIndexMigration("transient-long", mongodb.IndexDefinitionForTest{Collection: "coll", Name: "wanted", Keys: abKeys})
+	opts := mongodb.IndexMigrationOptionsForTest{BuildAttempts: 3, BuildRetryInterval: 10 * time.Millisecond}
+
+	require.Equal(t, "completed_with_errors", mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration, opts))
+	doc := env.record(t, "transient-long")
+	require.Equal(t, "failed", doc.Indexes[0].Outcome)
+	require.False(t, doc.NeedsOperator)
+	require.NotContains(t, env.indexes(t, "coll"), "wanted")
+
+	// Inside the backoff a runner keeps waiting; it does not return.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waiting := opts
+	waiting.Poll = 100 * time.Millisecond
+	require.Equal(t, "interrupted", mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, waiting))
+
+	// Once the backoff has passed the waiting runner takes the migration over.
+	short := 300 * time.Millisecond
+	waiting.RetryBackoff = &short
+	require.Equal(t, "completed", mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration, waiting))
+	require.Contains(t, env.indexes(t, "coll"), "wanted")
+	require.Equal(t, "completed", env.record(t, "transient-long").Status)
+}
+
+// An index that needs a newer server is skipped without failing the migration.
+func TestIndexMigration_IndexNeedingNewerServerIsSkipped(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	migration := mongodb.VisibilityIndexMigrationForTest()
+
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{ServerVersion: []int{6, 0, 12}}))
+
+	const wildcard = "visibility_namespace_search_attributes_wildcard"
+	outcomes := env.outcomes(t, migration.ID)
+	require.Equal(t, "skipped_unsupported", outcomes[wildcard])
+	require.NotContains(t, env.indexes(t, "visibility_executions"), wildcard)
+	for name, outcome := range outcomes {
+		if name != wildcard {
+			require.Equalf(t, "created", outcome, "%s", name)
+		}
+	}
+	require.Empty(t, env.logger.errors)
+}
+
+// A filter on a search attribute is served by the compound wildcard index and
+// stays inside its namespace.
+func TestIndexMigration_SearchAttributeFilterUsesNamespacedWildcard(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	require.Equal(t, "completed", env.run(t, mongodb.VisibilityIndexMigrationForTest(), mongodb.IndexMigrationOptionsForTest{}))
+
+	docs := make([]interface{}, 0, 400)
+	for i := 0; i < 200; i++ {
+		for _, ns := range []string{"ns-a", "ns-b"} {
+			docs = append(docs, bson.M{
+				"_id":               fmt.Sprintf("%s|wf-%d|run-%d", ns, i, i),
+				"namespace_id":      ns,
+				"workflow_id":       fmt.Sprintf("wf-%d", i),
+				"run_id":            fmt.Sprintf("run-%d", i),
+				"visibility_time":   time.Unix(int64(1700000000+i), 0).UTC(),
+				"search_attributes": bson.M{"CustomKeyword": "shared-value"},
+			})
+		}
+	}
+	_, err := env.raw.Collection("visibility_executions").InsertMany(testCtx(t), docs)
+	require.NoError(t, err)
+
+	var out bson.M
+	require.NoError(t, env.raw.RunCommand(testCtx(t), bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "find", Value: "visibility_executions"},
+			{Key: "filter", Value: bson.D{
+				{Key: "namespace_id", Value: "ns-a"},
+				{Key: "search_attributes.CustomKeyword", Value: "shared-value"},
+			}},
+		}},
+		{Key: "verbosity", Value: "executionStats"},
+	}).Decode(&out))
+	stats := out["executionStats"].(bson.M)
+	plan, err := bson.MarshalExtJSON(bson.M{"winningPlan": out["queryPlanner"].(bson.M)["winningPlan"]}, false, false)
+	require.NoError(t, err)
+	t.Logf("examined=%v plan=%s", stats["totalDocsExamined"], plan)
+
+	require.Contains(t, string(plan), "visibility_namespace_search_attributes_wildcard")
+	// 200 documents of ns-a match; the 200 of ns-b with the same value are not read.
+	require.EqualValues(t, 200, stats["totalDocsExamined"])
+}
+
+// With index migrations disabled a server builds nothing and reports what is
+// missing.
+func TestIndexMigration_DisabledOnlyReportsMissingIndexes(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	migration := mongodb.PrimaryIndexMigrationForTest()
+
+	missing := mongodb.ReportIndexMigrationForTest(testCtx(t), env.raw, env.logger, migration)
+	require.Len(t, missing, len(migration.Indexes))
+	require.Contains(t, missing, "history_nodes.history_nodes_branch_node_txn")
+	require.Equal(t, 1, env.logger.count(&env.logger.warns, "MongoDB index migration is disabled and some indexes are missing"))
+
+	// Through the factory: stores are created, nothing is built or recorded.
+	cfg := env.cfg
+	cfg.DisableIndexMigration = true
+	factory, err := mongodb.NewFactory(cfg, "index-migration-test", log.NewNoopLogger(), metrics.NoopMetricsHandler)
+	require.NoError(t, err)
+	_, err = factory.NewExecutionStore()
+	require.NoError(t, err)
+	factory.Close() // waits for the background report
+
+	require.NotContains(t, env.indexes(t, "history_nodes"), "history_nodes_branch_node_txn")
+	n, err := env.raw.Collection(mongodb.SchemaMigrationsCollectionForTest).CountDocuments(testCtx(t), bson.M{})
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	// Once the operator has built the indexes, nothing is reported.
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.Empty(t, mongodb.ReportIndexMigrationForTest(testCtx(t), env.raw, env.logger, migration))
 }

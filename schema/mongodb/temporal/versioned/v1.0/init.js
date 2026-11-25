@@ -299,6 +299,22 @@
     keys: { namespace_id: 1, [field]: 1, visibility_time: -1, run_id: 1 },
   });
 
+  // Compound wildcard indexes exist since MongoDB 7.0. On older servers the
+  // index is left out, as the Go migration does.
+  const serverMajor = Number(db.version().split(".")[0]);
+  const compoundWildcardIndexes =
+    serverMajor >= 7
+      ? [
+          {
+            name: "visibility_namespace_search_attributes_wildcard",
+            keys: { namespace_id: 1, "search_attributes.$**": 1 },
+          },
+        ]
+      : [];
+  if (serverMajor < 7) {
+    print("Skipping visibility_namespace_search_attributes_wildcard: it needs MongoDB 7.0 or later");
+  }
+
   const visibilityCollections = [
     {
       name: "visibility_executions",
@@ -318,7 +334,8 @@
         visibilityFiltered("visibility_workflow_id_time", "workflow_id"),
         visibilityFiltered("visibility_task_queue_time", "task_queue"),
         { name: "visibility_namespace_run", keys: { namespace_id: 1, run_id: 1 } },
-        { name: "visibility_search_attributes_wildcard", keys: { "search_attributes.$**": 1 } },
+        // Compound wildcard index led by namespace_id. Needs MongoDB 7.0.
+        ...compoundWildcardIndexes,
       ],
     },
     {
