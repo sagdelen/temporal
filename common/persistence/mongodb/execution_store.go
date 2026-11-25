@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	commonpb "go.temporal.io/api/common/v1"
@@ -167,7 +168,7 @@ type (
 		SignalInfos          []int64BlobDoc   `bson:"signal_infos,omitempty"`
 		SignalRequestedIDs   []string         `bson:"signal_requested_ids,omitempty"`
 		ChasmNodes           []chasmNodeDoc   `bson:"chasm_nodes,omitempty"`
-		BufferedEvents       *dataBlobDoc     `bson:"buffered_events,omitempty"`
+		BufferedEvents       bufferedBatches  `bson:"buffered_events,omitempty"`
 		Tasks                []historyTaskDoc `bson:"tasks,omitempty"`
 		Checksum             *dataBlobDoc     `bson:"checksum,omitempty"`
 	}
@@ -273,6 +274,54 @@ func timePtrFromProto(ts *timestamppb.Timestamp) *time.Time {
 	}
 	t := ts.AsTime().UTC()
 	return &t
+}
+
+// bufferedBatches holds the buffered event batches of an execution in the
+// order they were buffered.
+//
+// On disk a single batch is stored as one blob sub-document and two or more
+// batches as an array of them. The single-batch form is what the store wrote
+// when it could only hold one batch, so documents written before batches were
+// appended stay readable, and servers that have not been upgraded can still
+// read every document they could have written themselves. An empty buffer is
+// stored as null.
+type bufferedBatches []dataBlobDoc
+
+// MarshalBSONValue implements bson.ValueMarshaler.
+func (b bufferedBatches) MarshalBSONValue() (bsontype.Type, []byte, error) {
+	switch len(b) {
+	case 0:
+		return bsontype.Null, nil, nil
+	case 1:
+		return bson.MarshalValue(b[0])
+	default:
+		return bson.MarshalValue([]dataBlobDoc(b))
+	}
+}
+
+// UnmarshalBSONValue implements bson.ValueUnmarshaler.
+func (b *bufferedBatches) UnmarshalBSONValue(t bsontype.Type, data []byte) error {
+	switch t {
+	case bsontype.Null, bsontype.Undefined:
+		*b = nil
+		return nil
+	case bsontype.EmbeddedDocument:
+		var single dataBlobDoc
+		if err := bson.UnmarshalValue(t, data, &single); err != nil {
+			return err
+		}
+		*b = bufferedBatches{single}
+		return nil
+	case bsontype.Array:
+		var batches []dataBlobDoc
+		if err := bson.UnmarshalValue(t, data, &batches); err != nil {
+			return err
+		}
+		*b = batches
+		return nil
+	default:
+		return fmt.Errorf("unexpected BSON type %v for buffered_events", t)
+	}
 }
 
 func dataBlobToDoc(blob *commonpb.DataBlob) *dataBlobDoc {
@@ -1068,10 +1117,15 @@ func (s *executionStore) applyMutationToExecutionDocument(
 	doc.ChasmNodes = mapChasmNodes(chasmNodes)
 
 	// Buffered events.
+	// Buffered events are append-only between flushes: a mutation carries only
+	// its own new batch and the batches buffered by earlier transactions must be
+	// kept. Clearing first and appending afterwards matches the SQL stores, which
+	// delete the buffered rows and then insert the new batch.
 	if mutation.ClearBufferedEvents {
 		doc.BufferedEvents = nil
-	} else if mutation.NewBufferedEvents != nil {
-		doc.BufferedEvents = dataBlobToDoc(mutation.NewBufferedEvents)
+	}
+	if newBatch := dataBlobToDoc(mutation.NewBufferedEvents); newBatch != nil {
+		doc.BufferedEvents = append(doc.BufferedEvents, *newBatch)
 	}
 
 	// Tasks (best effort only tracked for observability in this stub).
@@ -1829,10 +1883,9 @@ func (s *executionStore) executionDocumentToMutableState(doc *executionDocument)
 		return nil
 	}
 
-	bufferedEventsBlob := dataBlobDocToBlob(doc.BufferedEvents)
 	var bufferedEvents []*commonpb.DataBlob
-	if bufferedEventsBlob != nil {
-		bufferedEvents = []*commonpb.DataBlob{bufferedEventsBlob}
+	for i := range doc.BufferedEvents {
+		bufferedEvents = append(bufferedEvents, dataBlobDocToBlob(&doc.BufferedEvents[i]))
 	}
 
 	state := &persistence.InternalWorkflowMutableState{
