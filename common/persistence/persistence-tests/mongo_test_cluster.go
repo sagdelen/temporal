@@ -13,6 +13,8 @@ import (
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
+	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/persistence/mongodb"
 	"go.temporal.io/server/temporal/environment"
 )
 
@@ -34,6 +36,24 @@ func (c *MongoTestCluster) SetupTestDatabase() {
 	if err := dropMongoDatabase(c.cfg); err != nil {
 		c.logger.Error("failed to drop mongo database before setup", tag.Error(err))
 	}
+	// Build the indexes of the background index migrations before the tests
+	// use the database. An index build takes a short exclusive collection
+	// lock, and a transaction that runs into it fails with LockTimeout.
+	if err := runMongoIndexMigrations(c.cfg, c.logger); err != nil {
+		c.logger.Error("failed to run mongo index migrations before setup", tag.Error(err))
+	}
+}
+
+func runMongoIndexMigrations(cfg config.MongoDB, logger log.Logger) error {
+	factory, err := mongodb.NewFactory(cfg, "test", logger, metrics.NoopMetricsHandler)
+	if err != nil {
+		return err
+	}
+	defer factory.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return factory.RunIndexMigrations(ctx)
 }
 
 func (c *MongoTestCluster) TearDownTestDatabase() {

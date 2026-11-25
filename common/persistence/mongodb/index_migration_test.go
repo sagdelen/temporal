@@ -568,3 +568,64 @@ func TestIndexMigration_InitScriptListsMigrationIndexes(t *testing.T) {
 		}
 	}
 }
+
+// Indexes that were built ahead of the server (for example with init.js) are
+// accepted as they are: the migration builds nothing.
+func TestIndexMigration_PrebuiltIndexesAreNotRebuilt(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+
+	migrations := []mongodb.IndexMigrationForTest{
+		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.VisibilityIndexMigrationForTest(),
+	}
+	for _, migration := range migrations {
+		for _, def := range migration.Indexes {
+			opts := options.Index().SetName(def.Name)
+			if def.Unique {
+				opts.SetUnique(true)
+			}
+			if def.ExpireAfterSeconds != nil {
+				opts.SetExpireAfterSeconds(*def.ExpireAfterSeconds)
+			}
+			_, err := env.raw.Collection(def.Collection).Indexes().
+				CreateOne(testCtx(t), mongo.IndexModel{Keys: def.Keys, Options: opts})
+			require.NoError(t, err)
+		}
+	}
+
+	for _, migration := range migrations {
+		require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+		doc := env.record(t, migration.ID)
+		require.Len(t, doc.Indexes, len(migration.Indexes))
+		for _, idx := range doc.Indexes {
+			require.Equalf(t, "exists", idx.Outcome, "%s.%s must be accepted, not built", idx.Collection, idx.Name)
+			require.Equal(t, idx.Name, idx.CreatedAs)
+		}
+	}
+	require.Empty(t, env.logger.errors)
+	require.Empty(t, env.logger.warns)
+}
+
+// RunIndexMigrations builds every index before it returns, and the background
+// migrations the factory starts afterwards find nothing left to do.
+func TestIndexMigration_FactoryRunIndexMigrations(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+
+	factory, err := mongodb.NewFactory(env.cfg, "index-migration-test", log.NewNoopLogger(), metrics.NoopMetricsHandler)
+	require.NoError(t, err)
+	defer factory.Close()
+
+	require.NoError(t, factory.RunIndexMigrations(testCtx(t)))
+
+	for _, migration := range []mongodb.IndexMigrationForTest{
+		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.VisibilityIndexMigrationForTest(),
+	} {
+		require.Equal(t, "completed", env.record(t, migration.ID).Status)
+		for _, def := range migration.Indexes {
+			require.Containsf(t, env.indexes(t, def.Collection), def.Name, "%s.%s", def.Collection, def.Name)
+		}
+	}
+
+	require.NoError(t, factory.RunIndexMigrations(testCtx(t)), "a second run is a no-op")
+}

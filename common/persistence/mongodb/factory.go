@@ -214,6 +214,24 @@ func (f *Factory) buildConnectionString() string {
 	return uri
 }
 
+// RunIndexMigrations runs the index migrations synchronously and returns an
+// error unless every index is in place afterwards. Servers do not call this:
+// they run the migrations in the background (startIndexMigration). It is for
+// tools and test fixtures that want every index in place before the database
+// is used, and it expects the primary and the visibility collections in the
+// database of this factory.
+func (f *Factory) RunIndexMigrations(ctx context.Context) error {
+	for _, migration := range []indexMigration{primaryIndexMigration(), visibilityIndexMigration()} {
+		outcome := newIndexMigrator(f.database, f.logger).run(ctx, migration)
+		switch outcome {
+		case indexMigrationCompleted, indexMigrationAlreadyCompleted:
+		default:
+			return fmt.Errorf("mongodb index migration %s did not complete: %s", migration.ID, outcome)
+		}
+	}
+	return nil
+}
+
 // Close closes the factory and underlying connections
 func (f *Factory) Close() {
 	// Stop background index migrations before the client goes away. An
