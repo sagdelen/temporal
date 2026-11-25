@@ -18,6 +18,7 @@ schema/mongodb/temporal/
 - Scripts are written for `mongosh`. They can be executed locally or as part of a deployment pipeline.
 - Each version directory should contain idempotent helpers. Future migrations can be added as additional scripts within the same version folder or as new version folders.
 - Collections and indexes defined here mirror the names used in `common/persistence/mongodb/*`.
+- Running the scripts is optional. The server creates its collections on first use, creates the baseline indexes when its stores start, and adds the remaining indexes with a background index migration (`common/persistence/mongodb/index_migration.go`). Use the scripts to prepare a database before the first server starts, or to build indexes ahead of an upgrade.
 
 ## Applying The Schema
 
@@ -29,10 +30,10 @@ mongosh "$MONGO_URI" schema/mongodb/temporal/versioned/v1.0/init.js
 ```
 
 > **Note**
-> The scripts intentionally do not drop or mutate existing collections. They create collections and indexes when missing so they are safe to rerun.
+> The scripts do not drop or mutate existing collections. They create collections and indexes when missing, so they are safe to rerun. The only indexes they drop are the ones an earlier version of the script created by mistake (listed as `obsoleteIndexes` in `init.js`). A script exits with a non-zero status when an index could not be created, for example a unique index over data that contains duplicates.
 
 ## Next Steps
 
-- Extend `init.js` as new collections or indexes are introduced.
+- Extend `init.js` as new collections or indexes are introduced. An index added to an index migration in the Go code must be added to `init.js` as well; `TestIndexMigration_InitScriptListsMigrationIndexes` checks this.
 - Add migration notes under new version directories when backward-incompatible changes are required.
 - Coordinate schema updates with documentation updates under `docs/development/persistence/mongodb-persistence-plugin.md`.

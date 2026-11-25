@@ -45,6 +45,14 @@ type (
 		clusterMDStore     p.ClusterMetadataStore
 		nexusEndpointStore p.NexusEndpointStore
 		visibilityStore    store.VisibilityStore
+
+		// Background index migrations, see index_migration.go. The context is
+		// nil for factories that were not built by NewFactory.
+		migrationCtx            context.Context
+		migrationCancel         context.CancelFunc
+		migrationWG             sync.WaitGroup
+		primaryMigrationOnce    sync.Once
+		visibilityMigrationOnce sync.Once
 	}
 )
 
@@ -68,7 +76,25 @@ func NewFactory(
 		return nil, fmt.Errorf("failed to initialize MongoDB factory: %w", err)
 	}
 
+	factory.migrationCtx, factory.migrationCancel = context.WithCancel(context.Background())
+
 	return factory, nil
+}
+
+// startIndexMigration runs an index migration in the background, once per
+// factory. It never blocks or fails the caller: the outcome is logged and
+// recorded in the schema_migrations collection.
+func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration) {
+	if f.migrationCtx == nil {
+		return
+	}
+	once.Do(func() {
+		f.migrationWG.Add(1)
+		go func() {
+			defer f.migrationWG.Done()
+			newIndexMigrator(f.database, f.logger).run(f.migrationCtx, migration)
+		}()
+	})
 }
 
 // initialize establishes MongoDB connection and detects topology
@@ -190,6 +216,13 @@ func (f *Factory) buildConnectionString() string {
 
 // Close closes the factory and underlying connections
 func (f *Factory) Close() {
+	// Stop background index migrations before the client goes away. An
+	// interrupted migration releases its lease and continues on a later start.
+	if f.migrationCancel != nil {
+		f.migrationCancel()
+		f.migrationWG.Wait()
+	}
+
 	if f.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -317,6 +350,7 @@ func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
 	}
 
 	f.executionStore = executionStore
+	f.startIndexMigration(&f.primaryMigrationOnce, primaryIndexMigration())
 	return executionStore, nil
 }
 
@@ -400,6 +434,7 @@ func (f *Factory) NewVisibilityStore(
 		return nil, err
 	}
 
+	f.startIndexMigration(&f.visibilityMigrationOnce, visibilityIndexMigration())
 	return visStore, nil
 }
 
