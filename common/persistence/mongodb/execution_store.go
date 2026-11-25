@@ -549,22 +549,10 @@ func taskKeySpecified(key taskspkg.Key) bool {
 	return !key.FireTime.IsZero() || key.TaskID != 0
 }
 
-// insertHistoryTaskDoc inserts a history task and treats an already existing
-// task with the same key as success.
-func (s *executionStore) insertHistoryTaskDoc(
-	ctx context.Context,
-	col client.Collection,
-	categoryType taskspkg.CategoryType,
-	categoryID int,
-	shardID int32,
-	task persistence.InternalHistoryTask,
-) error {
-	_, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
-	return err
-}
-
 // tryInsertHistoryTaskDoc inserts a history task. duplicate is true when a
 // task with the same key already exists; nothing is written in that case.
+// Inside a transaction the caller must then end the transaction with an
+// error, because a duplicate key error aborts it.
 func (s *executionStore) tryInsertHistoryTaskDoc(
 	ctx context.Context,
 	col client.Collection,
