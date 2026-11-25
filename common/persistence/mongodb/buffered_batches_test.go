@@ -141,3 +141,20 @@ func TestBufferedBatches_DecodesLegacyDocuments(t *testing.T) {
 	var invalid holder
 	require.Error(t, bson.Unmarshal(raw, &invalid))
 }
+
+// A stored blob without an encoding is read as proto3 (dataBlobDocToBlob), so
+// it must be merged like one instead of falling back to the array form.
+func TestAppendBufferedBatch_MissingEncodingIsProto3(t *testing.T) {
+	stored := serializedEventBatch(t, 5)
+	stored.Encoding = ""
+
+	buffer := appendBufferedBatch(bufferedBatches{stored}, serializedEventBatch(t, 6))
+	require.Len(t, buffer, 1)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3.String(), buffer[0].Encoding)
+
+	events, err := serialization.NewSerializer().DeserializeEvents(dataBlobDocToBlob(&buffer[0]))
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	require.EqualValues(t, 5, events[0].GetEventId())
+	require.EqualValues(t, 6, events[1].GetEventId())
+}
