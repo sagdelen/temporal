@@ -4,7 +4,9 @@ import (
 	"context"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 )
 
@@ -63,4 +65,20 @@ func RunIndexMigrationForTest(
 		m.retryBackoff = *opts.RetryBackoff
 	}
 	return string(m.run(ctx, migration))
+}
+
+// HistoryNodeQueryForTest returns the filter and sort ReadHistoryBranch uses.
+func HistoryNodeQueryForTest(
+	shardID int32,
+	treeID, branchID string,
+	req *persistence.InternalReadHistoryBranchRequest,
+	lastNodeID, lastTxnID int64,
+) (bson.M, bson.D) {
+	token := historyNodePageToken{LastNodeID: lastNodeID, LastTxnID: lastTxnID}
+	return historyNodeFilter(shardID, treeID, branchID, req, token), historyNodeSort(req.ReverseOrder)
+}
+
+// HistoryNodeDocIDForTest returns the _id of a history node document.
+func HistoryNodeDocIDForTest(treeID, branchID string, nodeID, txnID int64) string {
+	return historyNodeDocID(treeID, branchID, nodeID, txnID)
 }

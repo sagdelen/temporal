@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 )
@@ -628,4 +629,192 @@ func TestIndexMigration_FactoryRunIndexMigrations(t *testing.T) {
 	}
 
 	require.NoError(t, factory.RunIndexMigrations(testCtx(t)), "a second run is a no-op")
+}
+
+const (
+	historyReadTree   = "tree"
+	historyReadBranch = "branch"
+	historyReadNodes  = 3000
+	// historyReadSplitNode has two transactions (5 and 7); every other node
+	// has one, numbered like the node.
+	historyReadSplitNode = 2950
+)
+
+type historyReadNode struct {
+	NodeID int64 `bson:"node_id"`
+	TxnID  int64 `bson:"txn_id"`
+}
+
+// seedHistoryNodes writes one long branch plus unrelated branches and trees
+// around it, so that a scan that leaves its range shows up in the numbers.
+func (e *indexMigrationEnv) seedHistoryNodes(t *testing.T) {
+	t.Helper()
+	doc := func(tree, branch string, node, txn int64) bson.M {
+		return bson.M{
+			"_id":       mongodb.HistoryNodeDocIDForTest(tree, branch, node, txn),
+			"shard_id":  int32(1),
+			"tree_id":   tree,
+			"branch_id": branch,
+			"node_id":   node,
+			"txn_id":    txn,
+		}
+	}
+	docs := make([]interface{}, 0, historyReadNodes+1600)
+	for node := int64(1); node <= historyReadNodes; node++ {
+		if node == historyReadSplitNode {
+			docs = append(docs, doc(historyReadTree, historyReadBranch, node, 5), doc(historyReadTree, historyReadBranch, node, 7))
+			continue
+		}
+		docs = append(docs, doc(historyReadTree, historyReadBranch, node, node))
+	}
+	for node := int64(1); node <= 500; node++ {
+		docs = append(docs,
+			doc(historyReadTree, "a-branch-before", node, node),
+			doc(historyReadTree, "other-branch", node, node),
+			doc("z-other-tree", historyReadBranch, node, node),
+		)
+	}
+	_, err := e.raw.Collection("history_nodes").InsertMany(testCtx(t), docs)
+	require.NoError(t, err)
+}
+
+func historyReadQuery(minNode, maxNode int64, reverse bool, lastNode, lastTxn int64) (bson.M, bson.D) {
+	return mongodb.HistoryNodeQueryForTest(1, historyReadTree, historyReadBranch,
+		&persistence.InternalReadHistoryBranchRequest{MinNodeID: minNode, MaxNodeID: maxNode, ReverseOrder: reverse},
+		lastNode, lastTxn)
+}
+
+// read runs the query the way ReadHistoryBranch does and returns the nodes.
+func (e *indexMigrationEnv) readHistory(t *testing.T, filter bson.M, sort bson.D, limit int64) []historyReadNode {
+	t.Helper()
+	ctx := testCtx(t)
+	cursor, err := e.raw.Collection("history_nodes").Find(ctx, filter, options.Find().SetSort(sort).SetLimit(limit))
+	require.NoError(t, err)
+	var nodes []historyReadNode
+	require.NoError(t, cursor.All(ctx, &nodes))
+	return nodes
+}
+
+// examined returns how many documents the query looks at, and its plan.
+func (e *indexMigrationEnv) examined(t *testing.T, filter bson.M, sort bson.D, limit int64) (int64, string) {
+	t.Helper()
+	var out bson.M
+	require.NoError(t, e.raw.RunCommand(testCtx(t), bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "find", Value: "history_nodes"},
+			{Key: "filter", Value: filter},
+			{Key: "sort", Value: sort},
+			{Key: "limit", Value: limit},
+		}},
+		{Key: "verbosity", Value: "executionStats"},
+	}).Decode(&out))
+
+	stats, ok := out["executionStats"].(bson.M)
+	require.True(t, ok, "explain output has no executionStats section")
+	var docs int64
+	switch n := stats["totalDocsExamined"].(type) {
+	case int32:
+		docs = int64(n)
+	case int64:
+		docs = n
+	case float64:
+		docs = int64(n)
+	default:
+		t.Fatalf("unexpected totalDocsExamined type %T", n)
+	}
+	planner, ok := out["queryPlanner"].(bson.M)
+	require.True(t, ok, "explain output has no queryPlanner section")
+	plan, err := bson.MarshalExtJSON(bson.M{"winningPlan": planner["winningPlan"]}, false, false)
+	require.NoError(t, err)
+	return docs, string(plan)
+}
+
+func nodeRange(from, to int64) []historyReadNode {
+	var nodes []historyReadNode
+	step := int64(1)
+	if to < from {
+		step = -1
+	}
+	for node := from; node != to+step; node += step {
+		nodes = append(nodes, historyReadNode{NodeID: node, TxnID: node})
+	}
+	return nodes
+}
+
+// ReadHistoryBranch must return the right nodes in the right order and look
+// only at the part of the branch it reads. That has to hold with the new
+// history_nodes index and, while a migration has not built it yet, without.
+func TestIndexMigration_HistoryReadsStayWithinRange(t *testing.T) {
+	const limit = 10
+
+	for _, withIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("withIndex=%v", withIndex), func(t *testing.T) {
+			env := newIndexMigrationEnv(t)
+			if withIndex {
+				require.Equal(t, "completed", env.run(t, mongodb.PrimaryIndexMigrationForTest(), mongodb.IndexMigrationOptionsForTest{}))
+			}
+			env.seedHistoryNodes(t)
+
+			cases := []struct {
+				name     string
+				filter   bson.M
+				sort     bson.D
+				expected []historyReadNode
+				// rangeSize is the number of documents in the requested range,
+				// the most a read may look at while the index is missing.
+				rangeSize int64
+			}{}
+			add := func(name string, minNode, maxNode int64, reverse bool, lastNode, lastTxn int64, expected []historyReadNode, rangeSize int64) {
+				filter, sort := historyReadQuery(minNode, maxNode, reverse, lastNode, lastTxn)
+				cases = append(cases, struct {
+					name      string
+					filter    bson.M
+					sort      bson.D
+					expected  []historyReadNode
+					rangeSize int64
+				}{name, filter, sort, expected, rangeSize})
+			}
+
+			add("forward, start of the branch", 1, historyReadNodes+1, false, 0, 0,
+				nodeRange(1, 10), historyReadNodes+1)
+			add("forward, tail of a long branch", 2900, 2921, false, 0, 0,
+				nodeRange(2900, 2909), 21)
+			add("forward, page token", 1, historyReadNodes+1, false, 1500, 1500,
+				nodeRange(1501, 1510), 1502) // nodes 1500..3000, one of them twice
+			add("forward, across the node with two transactions", 2949, 2953, false, 0, 0,
+				[]historyReadNode{{2949, 2949}, {2950, 7}, {2950, 5}, {2951, 2951}, {2952, 2952}}, 5)
+			add("forward, page token inside the node with two transactions", 2949, 2953, false, 2950, 7,
+				[]historyReadNode{{2950, 5}, {2951, 2951}, {2952, 2952}}, 4)
+			add("reverse, end of the branch", 1, historyReadNodes+1, true, 0, 0,
+				nodeRange(3000, 2991), historyReadNodes+1)
+			add("reverse, page token", 1, historyReadNodes+1, true, 1500, 1500,
+				nodeRange(1499, 1490), 1499)
+			add("reverse, across the node with two transactions", 2949, 2953, true, 0, 0,
+				[]historyReadNode{{2952, 2952}, {2951, 2951}, {2950, 7}, {2950, 5}, {2949, 2949}}, 5)
+			add("reverse, page token inside the node with two transactions", 2949, 2953, true, 2950, 7,
+				[]historyReadNode{{2950, 5}, {2949, 2949}}, 2)
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					require.Equal(t, tc.expected, env.readHistory(t, tc.filter, tc.sort, limit))
+
+					docs, plan := env.examined(t, tc.filter, tc.sort, limit)
+					t.Logf("examined=%d plan=%s", docs, plan)
+					require.NotContains(t, plan, "COLLSCAN")
+
+					reverse := len(tc.sort) == 1
+					if withIndex || reverse {
+						// The sort comes from an index, so the read stops
+						// after one page.
+						require.NotContains(t, plan, `"SORT"`, "the read must not sort in memory")
+						require.LessOrEqual(t, docs, int64(2*limit))
+					} else {
+						// Forward order without the new index sorts in memory,
+						// but only the requested range.
+						require.LessOrEqual(t, docs, tc.rangeSize)
+					}
+				})
+			}
+		})
+	}
 }
