@@ -500,6 +500,8 @@ func taskKeySpecified(key taskspkg.Key) bool {
 	return !key.FireTime.IsZero() || key.TaskID != 0
 }
 
+// insertHistoryTaskDoc inserts a history task and treats an already existing
+// task with the same key as success.
 func (s *executionStore) insertHistoryTaskDoc(
 	ctx context.Context,
 	col client.Collection,
@@ -508,8 +510,22 @@ func (s *executionStore) insertHistoryTaskDoc(
 	shardID int32,
 	task persistence.InternalHistoryTask,
 ) error {
+	_, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
+	return err
+}
+
+// tryInsertHistoryTaskDoc inserts a history task. duplicate is true when a
+// task with the same key already exists; nothing is written in that case.
+func (s *executionStore) tryInsertHistoryTaskDoc(
+	ctx context.Context,
+	col client.Collection,
+	categoryType taskspkg.CategoryType,
+	categoryID int,
+	shardID int32,
+	task persistence.InternalHistoryTask,
+) (bool, error) {
 	if err := taskspkg.ValidateKey(task.Key); err != nil {
-		return serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
+		return false, serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
 	}
 
 	blobDoc := dataBlobToDoc(task.Blob)
@@ -525,9 +541,9 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
 		}
 	case taskspkg.CategoryTypeScheduled:
 		doc := scheduledTaskDocument{
@@ -540,16 +556,26 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
 		}
 	default:
-		return serviceerror.NewInternalf("unknown task category type: %v", categoryType)
+		return false, serviceerror.NewInternalf("unknown task category type: %v", categoryType)
 	}
-	return nil
+	return false, nil
 }
 
+// insertWorkflowTasks writes the history tasks of a workflow transaction and
+// must be called inside that transaction.
+//
+// A task key that already exists fails the transaction, as it does in the SQL
+// stores. It must not be ignored: a duplicate key error aborts a MongoDB
+// transaction, so every later operation and the commit would fail with
+// NoSuchTransaction, which the driver treats as transient and retries until
+// its time limit. Task IDs are allocated per shard owner, so a collision means
+// another owner wrote into the same range; Unavailable makes the shard renew
+// its range before the write is attempted again.
 func (s *executionStore) insertWorkflowTasks(
 	ctx context.Context,
 	shardID int32,
@@ -570,8 +596,15 @@ func (s *executionStore) insertWorkflowTasks(
 		}
 
 		for _, task := range taskList {
-			if err := s.insertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task); err != nil {
+			duplicate, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
+			if err != nil {
 				return err
+			}
+			if duplicate {
+				return serviceerror.NewUnavailablef(
+					"history task already exists. shard: %v, category: %v, task key: %v",
+					shardID, categoryID, task.Key,
+				)
 			}
 		}
 	}
