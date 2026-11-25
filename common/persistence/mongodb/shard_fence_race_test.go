@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/config"
@@ -43,13 +44,15 @@ type (
 	// transaction snapshot exists and before it commits.
 	hookDatabase struct {
 		client.Database
-		mu   sync.Mutex
-		hook func()
+		mu     sync.Mutex
+		hook   func()
+		repeat bool
 	}
 
 	hookCollection struct {
 		client.Collection
-		db *hookDatabase
+		db   *hookDatabase
+		name string
 	}
 
 	fenceEnv struct {
@@ -62,22 +65,39 @@ type (
 )
 
 func (d *hookDatabase) Collection(name string) client.Collection {
-	return &hookCollection{Collection: d.Database.Collection(name), db: d}
+	return &hookCollection{Collection: d.Database.Collection(name), db: d, name: name}
 }
 
 func (d *hookDatabase) arm(fn func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.hook = fn
+	d.repeat = false
 }
 
-func (d *hookDatabase) fire(ctx context.Context) {
+// armRepeating runs fn after the first operation of every transaction attempt.
+func (d *hookDatabase) armRepeating(fn func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.hook = fn
+	d.repeat = true
+}
+
+func (d *hookDatabase) fire(ctx context.Context, shardRead bool) {
 	if mongo.SessionFromContext(ctx) == nil {
 		return
 	}
 	d.mu.Lock()
 	fn := d.hook
-	d.hook = nil
+	if d.repeat {
+		// Every attempt starts by reading the shard document (the read half
+		// of the fence), so this runs once per attempt.
+		if !shardRead {
+			fn = nil
+		}
+	} else {
+		d.hook = nil
+	}
 	d.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -86,25 +106,25 @@ func (d *hookDatabase) fire(ctx context.Context) {
 
 func (c *hookCollection) FindOne(ctx context.Context, filter interface{}, opts ...*options.FindOneOptions) client.SingleResult {
 	res := c.Collection.FindOne(ctx, filter, opts...)
-	c.db.fire(ctx)
+	c.db.fire(ctx, c.name == "shards")
 	return res
 }
 
 func (c *hookCollection) Find(ctx context.Context, filter interface{}, opts ...*options.FindOptions) (client.Cursor, error) {
 	cur, err := c.Collection.Find(ctx, filter, opts...)
-	c.db.fire(ctx)
+	c.db.fire(ctx, false)
 	return cur, err
 }
 
 func (c *hookCollection) InsertOne(ctx context.Context, document interface{}, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error) {
 	res, err := c.Collection.InsertOne(ctx, document, opts...)
-	c.db.fire(ctx)
+	c.db.fire(ctx, false)
 	return res, err
 }
 
 func (c *hookCollection) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	res, err := c.Collection.UpdateOne(ctx, filter, update, opts...)
-	c.db.fire(ctx)
+	c.db.fire(ctx, false)
 	return res, err
 }
 
@@ -164,6 +184,21 @@ func (e *fenceEnv) bumpRange(timeout time.Duration) error {
 		RangeID:         2,
 		PreviousRangeID: 1,
 		ShardInfo:       &commonpb.DataBlob{Data: []byte("shard"), EncodingType: enumspb.ENCODING_TYPE_PROTO3},
+	})
+}
+
+// touchShard updates the shard document without changing its range, as the
+// periodic shard info persistence of the current owner does. The info must
+// differ from the stored one: an update that changes nothing is not a write
+// and does not conflict with anything.
+func (e *fenceEnv) touchShard(info string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return e.shard.UpdateShard(ctx, &persistence.InternalUpdateShardRequest{
+		ShardID:         fenceShardID,
+		RangeID:         1,
+		PreviousRangeID: 1,
+		ShardInfo:       &commonpb.DataBlob{Data: []byte(info), EncodingType: enumspb.ENCODING_TYPE_PROTO3},
 	})
 }
 
@@ -251,6 +286,7 @@ func TestShardFence_RangeBumpDuringTransaction(t *testing.T) {
 	if bumpErr != nil {
 		// The ownership change could not get past the open transaction, so the
 		// write legitimately belongs to range 1 (SQL shared-lock semantics).
+		require.Zero(t, rangeNow, "the range change failed but the shard is at range 2")
 		require.NoError(t, err)
 		return
 	}
@@ -286,4 +322,85 @@ func TestShardFence_AddHistoryTasksStaleRange(t *testing.T) {
 		"AddHistoryTasks with stale range 1 was accepted after the shard moved to range 2: err=%v transfer_tasks=%d",
 		err, transferTasks)
 	require.Zero(t, transferTasks, "stale owner wrote a transfer task")
+}
+
+// The shard document is also written by its current owner without a range
+// change (shard info persistence). That conflicts with an open transaction,
+// which must then be retried and commit exactly once.
+func TestShardFence_SameRangeShardUpdateDuringTransaction(t *testing.T) {
+	env := newFenceEnv(t)
+
+	var touchErr error
+	env.hooked.arm(func() {
+		touchErr = env.touchShard("shard-info", 3*time.Second)
+	})
+
+	_, err := env.exec.CreateWorkflowExecution(context.Background(), fenceCreateRequest(1, "wf-touch"))
+	require.NoError(t, err)
+	require.NoError(t, touchErr)
+	require.EqualValues(t, 1, env.count(t, "executions", bson.M{"workflow_id": "wf-touch"}))
+	require.EqualValues(t, 1, env.count(t, "current_executions", bson.M{"workflow_id": "wf-touch"}))
+	require.EqualValues(t, 1, env.count(t, "transfer_tasks", bson.M{"shard_id": fenceShardID}))
+}
+
+// A transaction that conflicts on every attempt gives up after a bounded
+// number of attempts with an error that means "not committed, retry later",
+// instead of being retried until the caller's deadline.
+func TestShardFence_RepeatedConflictGivesUp(t *testing.T) {
+	env := newFenceEnv(t)
+
+	attempts := 0
+	env.hooked.armRepeating(func() {
+		attempts++
+		_ = env.touchShard(fmt.Sprintf("shard-info-%d", attempts), 3*time.Second)
+	})
+
+	start := time.Now()
+	_, err := env.exec.CreateWorkflowExecution(context.Background(), fenceCreateRequest(1, "wf-conflicts"))
+	elapsed := time.Since(start)
+	t.Logf("attempts=%d elapsed=%v err=%v", attempts, elapsed, err)
+
+	var exhausted *serviceerror.ResourceExhausted
+	require.Truef(t, errors.As(err, &exhausted), "expected ResourceExhausted, got %T: %v", err, err)
+	require.Equal(t, 5, attempts, "the transaction must be attempted a bounded number of times")
+	require.Less(t, elapsed, 10*time.Second)
+	require.Zero(t, env.count(t, "executions", bson.M{"workflow_id": "wf-conflicts"}))
+	require.Zero(t, env.count(t, "transfer_tasks", bson.M{"shard_id": fenceShardID}))
+}
+
+func fenceAddTasksRequest(rangeID int64, taskIDs ...int64) *persistence.InternalAddHistoryTasksRequest {
+	batch := make([]persistence.InternalHistoryTask, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		batch = append(batch, fenceTask(id))
+	}
+	return &persistence.InternalAddHistoryTasksRequest{
+		ShardID:     fenceShardID,
+		RangeID:     rangeID,
+		NamespaceID: "ns-fence",
+		WorkflowID:  "wf-add-tasks",
+		Tasks:       map[tasks.Category][]persistence.InternalHistoryTask{tasks.CategoryTransfer: batch},
+	}
+}
+
+// Repeating a request whose earlier attempt committed is a no-op.
+func TestShardFence_AddHistoryTasksRepeatedRequestSucceeds(t *testing.T) {
+	env := newFenceEnv(t)
+
+	require.NoError(t, env.exec.AddHistoryTasks(context.Background(), fenceAddTasksRequest(1, 300, 301)))
+	require.NoError(t, env.exec.AddHistoryTasks(context.Background(), fenceAddTasksRequest(1, 300, 301)))
+	require.EqualValues(t, 2, env.count(t, "transfer_tasks", bson.M{"shard_id": fenceShardID}))
+}
+
+// A batch that collides with only some existing tasks was not written by an
+// earlier attempt. It must fail, not report success and lose the other tasks.
+func TestShardFence_AddHistoryTasksPartialCollisionFails(t *testing.T) {
+	env := newFenceEnv(t)
+
+	require.NoError(t, env.exec.AddHistoryTasks(context.Background(), fenceAddTasksRequest(1, 400)))
+
+	err := env.exec.AddHistoryTasks(context.Background(), fenceAddTasksRequest(1, 400, 401))
+	var unavailable *serviceerror.Unavailable
+	require.Truef(t, errors.As(err, &unavailable), "expected Unavailable, got %T: %v", err, err)
+	require.EqualValues(t, 1, env.count(t, "transfer_tasks", bson.M{"shard_id": fenceShardID}),
+		"nothing of the colliding batch may be written")
 }
