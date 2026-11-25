@@ -335,7 +335,9 @@ func (b *bufferedBatches) UnmarshalBSONValue(t bsontype.Type, data []byte) error
 // a single blob. A batch in any other encoding is kept as a separate entry.
 func appendBufferedBatch(batches bufferedBatches, batch dataBlobDoc) bufferedBatches {
 	proto3 := enumspb.ENCODING_TYPE_PROTO3.String()
-	if n := len(batches); n > 0 && batches[n-1].Encoding == proto3 && batch.Encoding == proto3 {
+	// A blob without an encoding is read as proto3 (see dataBlobDocToBlob).
+	isProto3 := func(encoding string) bool { return encoding == "" || encoding == proto3 }
+	if n := len(batches); n > 0 && isProto3(batches[n-1].Encoding) && isProto3(batch.Encoding) {
 		last := batches[n-1]
 		merged := make([]byte, 0, len(last.Data)+len(batch.Data))
 		merged = append(merged, last.Data...)
