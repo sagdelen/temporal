@@ -25,7 +25,9 @@
 //   - an index that cannot be created (for example a unique index over data
 //     that contains duplicates) is reported and skipped, the rest still runs;
 //   - no index is dropped, except the ones listed in obsoleteIndexes, which
-//     earlier versions of this script created by mistake.
+//     earlier versions of this script created by mistake. Such an index is
+//     only dropped while it still has the faulty definition and after the
+//     index that replaces it is in place.
 //
 // The script exits with a non-zero status if any index could not be created.
 
@@ -109,8 +111,16 @@
   function ensureCollection(database, spec) {
     const { name, options, indexes } = spec;
     if (!database.getCollectionNames().includes(name)) {
-      database.createCollection(name, options || {});
-      print(`Created collection ${database.getName()}.${name}`);
+      try {
+        database.createCollection(name, options || {});
+        print(`Created collection ${database.getName()}.${name}`);
+      } catch (err) {
+        // 48 = NamespaceExists: a running server created it in the meantime.
+        if (err.code !== 48) {
+          problems.push(`${database.getName()}.${name}: collection not created (${err.message})`);
+          return;
+        }
+      }
     }
     const collection = database.getCollection(name);
     (indexes || []).forEach((idx) => ensureIndex(collection, idx));
@@ -330,6 +340,11 @@
       // Same fields as task_queue_lookup but unique, which makes the creation
       // of the second version (v1/v2) of a task queue fail.
       keys: { namespace_id: 1, task_queue: 1, task_type: 1, subqueue: 1 },
+      unique: true,
+      replacedBy: {
+        name: "task_queue_lookup",
+        keys: { namespace_id: 1, task_queue: 1, task_type: 1, subqueue: 1 },
+      },
     },
   ];
 
@@ -340,8 +355,24 @@
 
   obsoleteIndexes.forEach((obsolete) => {
     const collection = obsolete.database.getCollection(obsolete.collection);
-    const existing = collection.getIndexes().find((idx) => idx.name === obsolete.name);
-    if (!existing || !sameKeys(obsolete.keys, existing.key)) {
+    const indexes = collection.getIndexes();
+    const existing = indexes.find((idx) => idx.name === obsolete.name);
+    // Only the faulty definition is obsolete. An index that merely has the
+    // same name (for example recreated without "unique") is left alone.
+    if (
+      !existing ||
+      !sameKeys(obsolete.keys, existing.key) ||
+      Boolean(existing.unique) !== Boolean(obsolete.unique)
+    ) {
+      return;
+    }
+    // Never leave the collection without an index on these keys.
+    const replacement = indexes.find((idx) => idx.name !== obsolete.name && matches(obsolete.replacedBy, idx));
+    if (!replacement) {
+      problems.push(
+        `${collection.getFullName()}.${obsolete.name}: obsolete index not dropped, ` +
+          `its replacement ${obsolete.replacedBy.name} is not in place`
+      );
       return;
     }
     try {
