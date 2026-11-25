@@ -3,6 +3,7 @@ package mongodb_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -545,4 +546,25 @@ func TestIndexMigration_FactoryRunsMigrationsInBackground(t *testing.T) {
 
 	factory.Close()
 	closed = true
+}
+
+// init.js lets operators build the schema ahead of the server. It must list
+// every index of the shipped migrations, under the same name and collection.
+func TestIndexMigration_InitScriptListsMigrationIndexes(t *testing.T) {
+	script, err := os.ReadFile("../../../schema/mongodb/temporal/versioned/v1.0/init.js")
+	require.NoError(t, err)
+	content := string(script)
+
+	for _, migration := range []mongodb.IndexMigrationForTest{
+		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.VisibilityIndexMigrationForTest(),
+	} {
+		require.Containsf(t, content, migration.ID, "init.js does not mention migration %s", migration.ID)
+		for _, def := range migration.Indexes {
+			require.Containsf(t, content, `"`+def.Name+`"`,
+				"init.js does not list index %s.%s of migration %s", def.Collection, def.Name, migration.ID)
+			require.Containsf(t, content, `name: "`+def.Collection+`"`,
+				"init.js does not create collection %s", def.Collection)
+		}
+	}
 }

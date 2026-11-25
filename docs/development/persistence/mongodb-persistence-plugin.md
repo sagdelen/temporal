@@ -1081,12 +1081,12 @@ The bootstrap script now lives at `schema/mongodb/temporal/versioned/v1.0/init.j
 
 Key additions since the queue/Nexus milestone:
 
-- `queue_metadata` — unique `_id` (`queue_metadata_lookup`) storing blob + ack metadata for legacy queues and DLQs.
+- `queue_metadata` — unique index on `queue_type` (`queue_metadata_lookup`) storing blob + ack metadata for legacy queues and DLQs.
 - `queue_messages` — ascending/descending `{ queue_type, message_id }` indexes for pagination (`queue_messages_lookup`, `queue_messages_lookup_desc`).
 - `queue_v2_metadata` — unique `{ queue_type, queue_name }` index for named queue metadata.
 - `queue_v2_messages` — indexes `{ queue_type, queue_name, partition, message_id }` and descending counterpart to support fan-out scans.
 - `nexus_endpoints_metadata` — singleton document tracking the Nexus table version.
-- `nexus_endpoints` — unique `_id` index for endpoints (payload + version).
+- `nexus_endpoints` — keyed by `_id`, which MongoDB indexes uniquely by itself; no explicit index is declared (payload + version).
 
 See `init.js` for the full list (it still ensures namespaces, shards, executions, history, tasks, visibility, etc.). The script only runs inserts when a collection or index is missing, so re-running it after deployments is safe.
 
