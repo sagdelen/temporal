@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/metrics"
@@ -70,6 +71,10 @@ func (s *transactionalStore) executeTransaction(ctx context.Context, fn func(con
 	})
 	if err != nil {
 		metrics.PersistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			// The caller's own deadline or cancellation: report it as such.
+			return nil, err
+		}
 		return nil, normalizeTransactionError(err)
 	}
 	return result, nil
@@ -100,13 +105,22 @@ func newTransactionConflictError(cause error) error {
 // Errors returned by the transaction callbacks are service or persistence
 // errors already and pass through. What can be left is an error of the driver
 // itself: a write conflict the driver stopped retrying (its own time limit),
-// which was not committed, or a failure to commit, whose outcome is unknown.
+// which was not committed, or a failure to start or commit the transaction,
+// whose outcome is unknown. The latter become Unavailable, as in the SQL
+// stores: the history service treats it as an unknown outcome, and it is the
+// error the persistence retry policy retries.
 func normalizeTransactionError(err error) error {
 	if isTransientWriteConflict(err) {
 		return newTransactionConflictError(err)
 	}
 	var serverErr mongo.ServerError
 	if errors.As(err, &serverErr) {
+		return serviceerror.NewUnavailablef("mongodb transaction failed: %v", err)
+	}
+	// Not a server reply: no server could be selected, or the driver gave up
+	// waiting for a connection or a reply.
+	var selectionErr topology.ServerSelectionError
+	if errors.As(err, &selectionErr) || mongo.IsTimeout(err) || mongo.IsNetworkError(err) {
 		return serviceerror.NewUnavailablef("mongodb transaction failed: %v", err)
 	}
 	return err
