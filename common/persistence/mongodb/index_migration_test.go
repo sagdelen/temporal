@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 )
@@ -310,8 +311,8 @@ func TestIndexMigration_ReplacesNonUniqueIndex(t *testing.T) {
 
 // A unique index over duplicate data is not created: the failure is logged
 // and recorded, the index it should replace stays, and the other indexes of
-// the migration are still created. After the data is fixed the migration
-// completes, but not before the retry backoff has passed.
+// the migration are still created. The migration is then blocked until an
+// operator fixes the data and deletes its record.
 func TestIndexMigration_DuplicateDataBlocksOnlyThatIndex(t *testing.T) {
 	env := newIndexMigrationEnv(t)
 	ctx := testCtx(t)
@@ -342,15 +343,21 @@ func TestIndexMigration_DuplicateDataBlocksOnlyThatIndex(t *testing.T) {
 	require.Equal(t, 1, env.logger.count(&env.logger.errors, "MongoDB index migration finished with errors"))
 	require.Zero(t, env.logger.count(&env.logger.infos, "MongoDB index migration completed"))
 
-	// Within the backoff the failed build is not attempted again.
-	require.Equal(t, "skipped_after_errors", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.True(t, doc.NeedsOperator)
 
-	// Still failing after the backoff while the duplicates are there.
-	require.Equal(t, "completed_with_errors", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	// A unique build over duplicates scans the collection, so it is not
+	// attempted again on its own, not even after the retry backoff.
+	require.Equal(t, "blocked_needs_operator", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.Equal(t, "blocked_needs_operator", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	require.Equal(t, 2, env.logger.count(&env.logger.errors, "MongoDB index migration is blocked"))
 
+	// The operator fixes the data and deletes the record; the next run
+	// completes the migration.
 	_, err = dup.DeleteOne(ctx, bson.M{"_id": 2})
 	require.NoError(t, err)
-	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{RetryBackoff: noBackoff()}))
+	_, err = env.raw.Collection(mongodb.SchemaMigrationsCollectionForTest).DeleteOne(ctx, bson.M{"_id": "duplicates"})
+	require.NoError(t, err)
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
 
 	indexes := env.indexes(t, "coll_dup")
 	require.True(t, indexes["wanted"].Unique)
@@ -628,4 +635,374 @@ func TestIndexMigration_FactoryRunIndexMigrations(t *testing.T) {
 	}
 
 	require.NoError(t, factory.RunIndexMigrations(testCtx(t)), "a second run is a no-op")
+}
+
+const (
+	historyReadTree   = "tree"
+	historyReadBranch = "branch"
+	historyReadNodes  = 3000
+	// historyReadSplitNode has two transactions (5 and 7); every other node
+	// has one, numbered like the node.
+	historyReadSplitNode = 2950
+)
+
+type historyReadNode struct {
+	NodeID int64 `bson:"node_id"`
+	TxnID  int64 `bson:"txn_id"`
+}
+
+// seedHistoryNodes writes one long branch plus unrelated branches and trees
+// around it, so that a scan that leaves its range shows up in the numbers.
+func (e *indexMigrationEnv) seedHistoryNodes(t *testing.T) {
+	t.Helper()
+	doc := func(tree, branch string, node, txn int64) bson.M {
+		return bson.M{
+			"_id":       mongodb.HistoryNodeDocIDForTest(tree, branch, node, txn),
+			"shard_id":  int32(1),
+			"tree_id":   tree,
+			"branch_id": branch,
+			"node_id":   node,
+			"txn_id":    txn,
+		}
+	}
+	docs := make([]interface{}, 0, historyReadNodes+1600)
+	for node := int64(1); node <= historyReadNodes; node++ {
+		if node == historyReadSplitNode {
+			docs = append(docs, doc(historyReadTree, historyReadBranch, node, 5), doc(historyReadTree, historyReadBranch, node, 7))
+			continue
+		}
+		docs = append(docs, doc(historyReadTree, historyReadBranch, node, node))
+	}
+	for node := int64(1); node <= 500; node++ {
+		docs = append(docs,
+			doc(historyReadTree, "a-branch-before", node, node),
+			doc(historyReadTree, "other-branch", node, node),
+			doc("z-other-tree", historyReadBranch, node, node),
+		)
+	}
+	_, err := e.raw.Collection("history_nodes").InsertMany(testCtx(t), docs)
+	require.NoError(t, err)
+}
+
+func historyReadQuery(minNode, maxNode int64, reverse bool, lastNode, lastTxn int64) (bson.M, bson.D) {
+	return mongodb.HistoryNodeQueryForTest(1, historyReadTree, historyReadBranch,
+		&persistence.InternalReadHistoryBranchRequest{MinNodeID: minNode, MaxNodeID: maxNode, ReverseOrder: reverse},
+		lastNode, lastTxn)
+}
+
+// read runs the query the way ReadHistoryBranch does and returns the nodes.
+func (e *indexMigrationEnv) readHistory(t *testing.T, filter bson.M, sort bson.D, limit int64) []historyReadNode {
+	t.Helper()
+	ctx := testCtx(t)
+	cursor, err := e.raw.Collection("history_nodes").Find(ctx, filter, options.Find().SetSort(sort).SetLimit(limit))
+	require.NoError(t, err)
+	var nodes []historyReadNode
+	require.NoError(t, cursor.All(ctx, &nodes))
+	return nodes
+}
+
+// examined returns how many documents the query looks at, and its plan.
+func (e *indexMigrationEnv) examined(t *testing.T, filter bson.M, sort bson.D, limit int64) (int64, string) {
+	t.Helper()
+	var out bson.M
+	require.NoError(t, e.raw.RunCommand(testCtx(t), bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "find", Value: "history_nodes"},
+			{Key: "filter", Value: filter},
+			{Key: "sort", Value: sort},
+			{Key: "limit", Value: limit},
+		}},
+		{Key: "verbosity", Value: "executionStats"},
+	}).Decode(&out))
+
+	stats, ok := out["executionStats"].(bson.M)
+	require.True(t, ok, "explain output has no executionStats section")
+	var docs int64
+	switch n := stats["totalDocsExamined"].(type) {
+	case int32:
+		docs = int64(n)
+	case int64:
+		docs = n
+	case float64:
+		docs = int64(n)
+	default:
+		t.Fatalf("unexpected totalDocsExamined type %T", n)
+	}
+	planner, ok := out["queryPlanner"].(bson.M)
+	require.True(t, ok, "explain output has no queryPlanner section")
+	plan, err := bson.MarshalExtJSON(bson.M{"winningPlan": planner["winningPlan"]}, false, false)
+	require.NoError(t, err)
+	return docs, string(plan)
+}
+
+func nodeRange(from, to int64) []historyReadNode {
+	var nodes []historyReadNode
+	step := int64(1)
+	if to < from {
+		step = -1
+	}
+	for node := from; node != to+step; node += step {
+		nodes = append(nodes, historyReadNode{NodeID: node, TxnID: node})
+	}
+	return nodes
+}
+
+// ReadHistoryBranch must return the right nodes in the right order and look
+// only at the part of the branch it reads. That has to hold with the new
+// history_nodes index and, while a migration has not built it yet, without.
+func TestIndexMigration_HistoryReadsStayWithinRange(t *testing.T) {
+	const limit = 10
+
+	for _, withIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("withIndex=%v", withIndex), func(t *testing.T) {
+			env := newIndexMigrationEnv(t)
+			if withIndex {
+				require.Equal(t, "completed", env.run(t, mongodb.PrimaryIndexMigrationForTest(), mongodb.IndexMigrationOptionsForTest{}))
+			}
+			env.seedHistoryNodes(t)
+
+			cases := []struct {
+				name     string
+				filter   bson.M
+				sort     bson.D
+				expected []historyReadNode
+				// rangeSize is the number of documents in the requested range,
+				// the most a read may look at while the index is missing.
+				rangeSize int64
+			}{}
+			add := func(name string, minNode, maxNode int64, reverse bool, lastNode, lastTxn int64, expected []historyReadNode, rangeSize int64) {
+				filter, sort := historyReadQuery(minNode, maxNode, reverse, lastNode, lastTxn)
+				cases = append(cases, struct {
+					name      string
+					filter    bson.M
+					sort      bson.D
+					expected  []historyReadNode
+					rangeSize int64
+				}{name, filter, sort, expected, rangeSize})
+			}
+
+			add("forward, start of the branch", 1, historyReadNodes+1, false, 0, 0,
+				nodeRange(1, 10), historyReadNodes+1)
+			add("forward, tail of a long branch", 2900, 2921, false, 0, 0,
+				nodeRange(2900, 2909), 21)
+			add("forward, page token", 1, historyReadNodes+1, false, 1500, 1500,
+				nodeRange(1501, 1510), 1502) // nodes 1500..3000, one of them twice
+			add("forward, across the node with two transactions", 2949, 2953, false, 0, 0,
+				[]historyReadNode{{2949, 2949}, {2950, 7}, {2950, 5}, {2951, 2951}, {2952, 2952}}, 5)
+			add("forward, page token inside the node with two transactions", 2949, 2953, false, 2950, 7,
+				[]historyReadNode{{2950, 5}, {2951, 2951}, {2952, 2952}}, 4)
+			add("reverse, end of the branch", 1, historyReadNodes+1, true, 0, 0,
+				nodeRange(3000, 2991), historyReadNodes+1)
+			add("reverse, page token", 1, historyReadNodes+1, true, 1500, 1500,
+				nodeRange(1499, 1490), 1499)
+			add("reverse, across the node with two transactions", 2949, 2953, true, 0, 0,
+				[]historyReadNode{{2952, 2952}, {2951, 2951}, {2950, 7}, {2950, 5}, {2949, 2949}}, 5)
+			add("reverse, page token inside the node with two transactions", 2949, 2953, true, 2950, 7,
+				[]historyReadNode{{2950, 5}, {2949, 2949}}, 2)
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					require.Equal(t, tc.expected, env.readHistory(t, tc.filter, tc.sort, limit))
+
+					docs, plan := env.examined(t, tc.filter, tc.sort, limit)
+					t.Logf("examined=%d plan=%s", docs, plan)
+					require.NotContains(t, plan, "COLLSCAN")
+
+					reverse := len(tc.sort) == 1
+					if withIndex || reverse {
+						// The sort comes from an index, so the read stops
+						// after one page.
+						require.NotContains(t, plan, `"SORT"`, "the read must not sort in memory")
+						require.LessOrEqual(t, docs, int64(2*limit))
+					} else {
+						// Forward order without the new index sorts in memory,
+						// but only the requested range.
+						require.LessOrEqual(t, docs, tc.rangeSize)
+					}
+				})
+			}
+		})
+	}
+}
+
+// failingIndexDatabase makes the first index builds fail with a given error.
+type (
+	failingIndexDatabase struct {
+		client.Database
+		mu       sync.Mutex
+		failures int
+		err      error
+	}
+
+	failingIndexCollection struct {
+		client.Collection
+		db *failingIndexDatabase
+	}
+
+	failingIndexView struct {
+		client.IndexView
+		db *failingIndexDatabase
+	}
+)
+
+func (d *failingIndexDatabase) Collection(name string) client.Collection {
+	return &failingIndexCollection{Collection: d.Database.Collection(name), db: d}
+}
+
+func (c *failingIndexCollection) Indexes() client.IndexView {
+	return &failingIndexView{IndexView: c.Collection.Indexes(), db: c.db}
+}
+
+func (v *failingIndexView) CreateOne(ctx context.Context, model mongo.IndexModel, opts ...*options.CreateIndexesOptions) (string, error) {
+	v.db.mu.Lock()
+	fail := v.db.failures > 0
+	if fail {
+		v.db.failures--
+	}
+	v.db.mu.Unlock()
+	if fail {
+		return "", v.db.err
+	}
+	return v.IndexView.CreateOne(ctx, model, opts...)
+}
+
+// notWritablePrimary is what a build gets when the primary steps down.
+var notWritablePrimary = mongo.CommandError{Code: 10107, Name: "NotWritablePrimary", Message: "not primary"}
+
+// A transient error is retried for the index at hand, so the migration still
+// completes in the same run.
+func TestIndexMigration_TransientErrorIsRetriedInProcess(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	db := &failingIndexDatabase{Database: env.raw, failures: 2, err: notWritablePrimary}
+	migration := oneIndexMigration("transient", mongodb.IndexDefinitionForTest{Collection: "coll", Name: "wanted", Keys: abKeys})
+
+	outcome := mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration,
+		mongodb.IndexMigrationOptionsForTest{BuildRetryInterval: 10 * time.Millisecond})
+
+	require.Equal(t, "completed", outcome)
+	require.Contains(t, env.indexes(t, "coll"), "wanted")
+	require.Equal(t, 2, env.logger.count(&env.logger.warns, "MongoDB index migration: transient error, retrying the index"))
+	require.Empty(t, env.logger.errors)
+}
+
+// When the transient error outlasts the retries of the index, the migration
+// ends with errors, waits for its backoff instead of giving up, and completes
+// on the next attempt without anyone restarting a server.
+func TestIndexMigration_TransientErrorIsRetriedAfterBackoff(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	db := &failingIndexDatabase{Database: env.raw, failures: 3, err: notWritablePrimary}
+	migration := oneIndexMigration("transient-long", mongodb.IndexDefinitionForTest{Collection: "coll", Name: "wanted", Keys: abKeys})
+	opts := mongodb.IndexMigrationOptionsForTest{BuildAttempts: 3, BuildRetryInterval: 10 * time.Millisecond}
+
+	require.Equal(t, "completed_with_errors", mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration, opts))
+	doc := env.record(t, "transient-long")
+	require.Equal(t, "failed", doc.Indexes[0].Outcome)
+	require.False(t, doc.NeedsOperator)
+	require.NotContains(t, env.indexes(t, "coll"), "wanted")
+
+	// Inside the backoff a runner keeps waiting; it does not return.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waiting := opts
+	waiting.Poll = 100 * time.Millisecond
+	require.Equal(t, "interrupted", mongodb.RunIndexMigrationForTest(ctx, db, env.logger, migration, waiting))
+
+	// Once the backoff has passed the waiting runner takes the migration over.
+	short := 300 * time.Millisecond
+	waiting.RetryBackoff = &short
+	require.Equal(t, "completed", mongodb.RunIndexMigrationForTest(testCtx(t), db, env.logger, migration, waiting))
+	require.Contains(t, env.indexes(t, "coll"), "wanted")
+	require.Equal(t, "completed", env.record(t, "transient-long").Status)
+}
+
+// An index that needs a newer server is skipped without failing the migration.
+func TestIndexMigration_IndexNeedingNewerServerIsSkipped(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	migration := mongodb.VisibilityIndexMigrationForTest()
+
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{ServerVersion: []int{6, 0, 12}}))
+
+	const wildcard = "visibility_namespace_search_attributes_wildcard"
+	outcomes := env.outcomes(t, migration.ID)
+	require.Equal(t, "skipped_unsupported", outcomes[wildcard])
+	require.NotContains(t, env.indexes(t, "visibility_executions"), wildcard)
+	for name, outcome := range outcomes {
+		if name != wildcard {
+			require.Equalf(t, "created", outcome, "%s", name)
+		}
+	}
+	require.Empty(t, env.logger.errors)
+}
+
+// A filter on a search attribute is served by the compound wildcard index and
+// stays inside its namespace.
+func TestIndexMigration_SearchAttributeFilterUsesNamespacedWildcard(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	require.Equal(t, "completed", env.run(t, mongodb.VisibilityIndexMigrationForTest(), mongodb.IndexMigrationOptionsForTest{}))
+
+	docs := make([]interface{}, 0, 400)
+	for i := 0; i < 200; i++ {
+		for _, ns := range []string{"ns-a", "ns-b"} {
+			docs = append(docs, bson.M{
+				"_id":               fmt.Sprintf("%s|wf-%d|run-%d", ns, i, i),
+				"namespace_id":      ns,
+				"workflow_id":       fmt.Sprintf("wf-%d", i),
+				"run_id":            fmt.Sprintf("run-%d", i),
+				"visibility_time":   time.Unix(int64(1700000000+i), 0).UTC(),
+				"search_attributes": bson.M{"CustomKeyword": "shared-value"},
+			})
+		}
+	}
+	_, err := env.raw.Collection("visibility_executions").InsertMany(testCtx(t), docs)
+	require.NoError(t, err)
+
+	var out bson.M
+	require.NoError(t, env.raw.RunCommand(testCtx(t), bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "find", Value: "visibility_executions"},
+			{Key: "filter", Value: bson.D{
+				{Key: "namespace_id", Value: "ns-a"},
+				{Key: "search_attributes.CustomKeyword", Value: "shared-value"},
+			}},
+		}},
+		{Key: "verbosity", Value: "executionStats"},
+	}).Decode(&out))
+	stats := out["executionStats"].(bson.M)
+	plan, err := bson.MarshalExtJSON(bson.M{"winningPlan": out["queryPlanner"].(bson.M)["winningPlan"]}, false, false)
+	require.NoError(t, err)
+	t.Logf("examined=%v plan=%s", stats["totalDocsExamined"], plan)
+
+	require.Contains(t, string(plan), "visibility_namespace_search_attributes_wildcard")
+	// 200 documents of ns-a match; the 200 of ns-b with the same value are not read.
+	require.EqualValues(t, 200, stats["totalDocsExamined"])
+}
+
+// With index migrations disabled a server builds nothing and reports what is
+// missing.
+func TestIndexMigration_DisabledOnlyReportsMissingIndexes(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	migration := mongodb.PrimaryIndexMigrationForTest()
+
+	missing := mongodb.ReportIndexMigrationForTest(testCtx(t), env.raw, env.logger, migration)
+	require.Len(t, missing, len(migration.Indexes))
+	require.Contains(t, missing, "history_nodes.history_nodes_branch_node_txn")
+	require.Equal(t, 1, env.logger.count(&env.logger.warns, "MongoDB index migration is disabled and some indexes are missing"))
+
+	// Through the factory: stores are created, nothing is built or recorded.
+	cfg := env.cfg
+	cfg.DisableIndexMigration = true
+	factory, err := mongodb.NewFactory(cfg, "index-migration-test", log.NewNoopLogger(), metrics.NoopMetricsHandler)
+	require.NoError(t, err)
+	_, err = factory.NewExecutionStore()
+	require.NoError(t, err)
+	factory.Close() // waits for the background report
+
+	require.NotContains(t, env.indexes(t, "history_nodes"), "history_nodes_branch_node_txn")
+	n, err := env.raw.Collection(mongodb.SchemaMigrationsCollectionForTest).CountDocuments(testCtx(t), bson.M{})
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	// Once the operator has built the indexes, nothing is reported.
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+	require.Empty(t, mongodb.ReportIndexMigrationForTest(testCtx(t), env.raw, env.logger, migration))
 }

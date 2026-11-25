@@ -471,6 +471,12 @@ type (
 		// WriteConcern defines the level of acknowledgment requested from MongoDB
 		// Options: majority, w1, w2, w3, etc.
 		WriteConcern string `yaml:"writeConcern"`
+		// DisableIndexMigration turns off the background index migrations. By
+		// default a server builds the indexes that are missing in the database
+		// after it starts. When this is set it builds nothing and only logs
+		// which indexes are missing; build them with
+		// schema/mongodb/temporal/versioned/v1.0/init.js instead.
+		DisableIndexMigration bool `yaml:"disableIndexMigration"`
 	}
 
 	// CustomDatastoreConfig is the configuration for connecting to a custom datastore that is not supported by temporal core

@@ -4,7 +4,9 @@ import (
 	"context"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 )
 
@@ -23,6 +25,12 @@ type (
 		Heartbeat    time.Duration
 		Poll         time.Duration
 		RetryBackoff *time.Duration
+		// BuildAttempts and BuildRetryInterval control the retries of one
+		// index after a transient error.
+		BuildAttempts      int
+		BuildRetryInterval time.Duration
+		// ServerVersion replaces the version read from the server.
+		ServerVersion []int
 	}
 )
 
@@ -62,5 +70,41 @@ func RunIndexMigrationForTest(
 	if opts.RetryBackoff != nil {
 		m.retryBackoff = *opts.RetryBackoff
 	}
+	if opts.BuildAttempts > 0 {
+		m.buildAttempts = opts.BuildAttempts
+	}
+	if opts.BuildRetryInterval > 0 {
+		m.buildRetryInterval = opts.BuildRetryInterval
+	}
+	if opts.ServerVersion != nil {
+		m.serverVersion = opts.ServerVersion
+	}
 	return string(m.run(ctx, migration))
+}
+
+// ReportIndexMigrationForTest returns the indexes a server with index
+// migrations disabled reports as missing.
+func ReportIndexMigrationForTest(
+	ctx context.Context,
+	db client.Database,
+	logger log.Logger,
+	migration IndexMigrationForTest,
+) []string {
+	return newIndexMigrator(db, logger).report(ctx, migration)
+}
+
+// HistoryNodeQueryForTest returns the filter and sort ReadHistoryBranch uses.
+func HistoryNodeQueryForTest(
+	shardID int32,
+	treeID, branchID string,
+	req *persistence.InternalReadHistoryBranchRequest,
+	lastNodeID, lastTxnID int64,
+) (bson.M, bson.D) {
+	token := historyNodePageToken{LastNodeID: lastNodeID, LastTxnID: lastTxnID}
+	return historyNodeFilter(shardID, treeID, branchID, req, token), historyNodeSort(req.ReverseOrder)
+}
+
+// HistoryNodeDocIDForTest returns the _id of a history node document.
+func HistoryNodeDocIDForTest(treeID, branchID string, nodeID, txnID int64) string {
+	return historyNodeDocID(treeID, branchID, nodeID, txnID)
 }

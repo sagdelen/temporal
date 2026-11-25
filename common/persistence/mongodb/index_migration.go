@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -30,7 +31,16 @@ import (
 //   - the outcome of every index is logged and recorded in schema_migrations,
 //     so later starts skip a completed migration;
 //   - an index that cannot be created (for example a unique index over data
-//     that contains duplicates) is reported and skipped, the rest still runs.
+//     that contains duplicates) is reported and skipped, the rest still runs;
+//   - transient errors (network, primary change) are retried, first for the
+//     index at hand and then for the migration as a whole after a backoff. A
+//     unique index that failed on duplicate data is not retried on its own,
+//     because every attempt scans the collection: an operator fixes the data
+//     and deletes the migration's record to have it run again.
+//
+// Setting disableIndexMigration in the MongoDB datastore config turns the
+// builds off. The server then only reports which indexes are missing, and the
+// operator builds them with schema/mongodb/temporal/versioned/v1.0/init.js.
 //
 // A migration never drops an index unless the definition of its replacement
 // names it in Replaces, and then only after the replacement exists.
@@ -47,6 +57,12 @@ const (
 	defaultIndexMigrationHeartbeat    = 30 * time.Second
 	defaultIndexMigrationPoll         = time.Minute
 	defaultIndexMigrationRetryBackoff = 30 * time.Minute
+
+	// A transient failure of one index is retried this many times, waiting the
+	// attempt number times the interval in between, before the index is given
+	// up for this run of the migration.
+	defaultIndexBuildAttempts      = 5
+	defaultIndexBuildRetryInterval = 5 * time.Second
 
 	indexMigrationStatusRunning             = "running"
 	indexMigrationStatusCompleted           = "completed"
@@ -67,6 +83,9 @@ const (
 	// indexOutcomeExistsOtherName: an index with the same keys and options was
 	// there under another name, which serves the same queries.
 	indexOutcomeExistsOtherName = "exists_other_name"
+	// indexOutcomeSkippedUnsupported: the server is older than the version the
+	// index needs. Nothing was changed, and this is not an error.
+	indexOutcomeSkippedUnsupported = "skipped_unsupported"
 	// indexOutcomeConflict: the name (and the fallback name) is used by a
 	// different index, or the server refused the definition next to an existing
 	// index. Nothing was changed.
@@ -89,9 +108,10 @@ const (
 	indexMigrationCompletedWithErrors indexMigrationOutcome = "completed_with_errors"
 	// indexMigrationAlreadyCompleted: the migration was completed earlier or by another process.
 	indexMigrationAlreadyCompleted indexMigrationOutcome = "already_completed"
-	// indexMigrationSkippedAfterErrors: an earlier attempt ended with errors
-	// and the retry backoff has not passed yet.
-	indexMigrationSkippedAfterErrors indexMigrationOutcome = "skipped_after_errors"
+	// indexMigrationBlocked: an earlier attempt could not build a unique index
+	// because of duplicate data. It is not retried until an operator deletes
+	// the migration's record.
+	indexMigrationBlocked indexMigrationOutcome = "blocked_needs_operator"
 	// indexMigrationInterrupted: the context was cancelled before the migration finished.
 	indexMigrationInterrupted indexMigrationOutcome = "interrupted"
 )
@@ -109,6 +129,9 @@ type (
 		// dropped once this index exists. An index named here is only dropped
 		// when its keys are identical to Keys.
 		Replaces []string
+		// MinServerVersion is the lowest MongoDB version (major, minor) that
+		// supports the index. On an older server the index is skipped.
+		MinServerVersion []int
 	}
 
 	// indexMigration is a named, ordered set of index definitions. The ID is
@@ -130,13 +153,16 @@ type (
 	}
 
 	indexMigrationDocument struct {
-		ID         string                 `bson:"_id"`
-		Status     string                 `bson:"status"`
-		Owner      string                 `bson:"owner"`
-		LeaseUntil time.Time              `bson:"lease_until"`
-		StartedAt  time.Time              `bson:"started_at"`
-		FinishedAt *time.Time             `bson:"finished_at,omitempty"`
-		Indexes    []indexMigrationResult `bson:"indexes,omitempty"`
+		ID         string     `bson:"_id"`
+		Status     string     `bson:"status"`
+		Owner      string     `bson:"owner"`
+		LeaseUntil time.Time  `bson:"lease_until"`
+		StartedAt  time.Time  `bson:"started_at"`
+		FinishedAt *time.Time `bson:"finished_at,omitempty"`
+		// NeedsOperator is set when the migration ended with an error that a
+		// retry cannot fix (duplicate data under a unique index).
+		NeedsOperator bool                   `bson:"needs_operator,omitempty"`
+		Indexes       []indexMigrationResult `bson:"indexes,omitempty"`
 	}
 
 	existingIndex struct {
@@ -158,6 +184,13 @@ type (
 		heartbeat    time.Duration
 		poll         time.Duration
 		retryBackoff time.Duration
+
+		buildAttempts      int
+		buildRetryInterval time.Duration
+
+		// serverVersion is the MongoDB version (major, minor, ...), read from
+		// the server on first use.
+		serverVersion []int
 	}
 
 	indexMigrationAcquireState int
@@ -167,7 +200,8 @@ const (
 	indexMigrationAcquired indexMigrationAcquireState = iota
 	indexMigrationHeldByOther
 	indexMigrationDone
-	indexMigrationFailedRecently
+	indexMigrationWaitingForRetry
+	indexMigrationNeedsOperator
 )
 
 // primaryIndexMigration adds the indexes the execution store queries need on
@@ -259,10 +293,19 @@ func visibilityIndexMigration() indexMigration {
 			},
 			{
 				// Search attribute names are dynamic, so one wildcard index
-				// covers equality and range filters on all of them.
+				// covers equality and range filters on all of them. It is a
+				// compound wildcard index led by namespace_id, so a filter on
+				// a search attribute only scans its own namespace. Compound
+				// wildcard indexes exist since MongoDB 7.0; on older servers
+				// the index is left out and such filters keep scanning the
+				// namespace through the visibility_time index.
 				Collection: collectionVisibilityExecutions,
-				Name:       "visibility_search_attributes_wildcard",
-				Keys:       bson.D{{Key: "search_attributes.$**", Value: 1}},
+				Name:       "visibility_namespace_search_attributes_wildcard",
+				Keys: bson.D{
+					{Key: "namespace_id", Value: 1},
+					{Key: "search_attributes.$**", Value: 1},
+				},
+				MinServerVersion: []int{7, 0},
 			},
 		},
 	}
@@ -282,16 +325,21 @@ func newIndexMigrator(db client.Database, logger log.Logger) *indexMigrator {
 		heartbeat:    defaultIndexMigrationHeartbeat,
 		poll:         defaultIndexMigrationPoll,
 		retryBackoff: defaultIndexMigrationRetryBackoff,
+
+		buildAttempts:      defaultIndexBuildAttempts,
+		buildRetryInterval: defaultIndexBuildRetryInterval,
 	}
 }
 
 // run executes the migration unless it is already completed. While another
-// process holds the lease it waits and checks again, so the migration still
-// finishes if that process dies. It returns when the migration is completed
-// (by anyone), was attempted by this process, is in its retry backoff after an
-// attempt with errors, or ctx is cancelled.
+// process holds the lease, or while the migration is in its backoff after an
+// attempt that ended with errors, it waits and checks again, so the migration
+// still finishes if the other process dies or once the errors have gone away.
+// It returns when the migration is completed (by anyone), was attempted by
+// this process, is blocked until an operator acts, or ctx is cancelled.
 func (m *indexMigrator) run(ctx context.Context, migration indexMigration) indexMigrationOutcome {
 	migrationTag := tag.NewStringTag("migration", migration.ID)
+	loggedWaiting := false
 	for {
 		state, err := m.tryAcquire(ctx, migration.ID)
 		switch {
@@ -305,11 +353,20 @@ func (m *indexMigrator) run(ctx context.Context, migration indexMigration) index
 		case state == indexMigrationDone:
 			m.logger.Debug("MongoDB index migration already completed", migrationTag)
 			return indexMigrationAlreadyCompleted
-		case state == indexMigrationFailedRecently:
-			m.logger.Warn("MongoDB index migration ended with errors earlier and is in its retry backoff; "+
-				"it is retried when a server starts after the backoff. See the schema_migrations collection for details",
+		case state == indexMigrationNeedsOperator:
+			m.logger.Error("MongoDB index migration is blocked: a unique index could not be built because the "+
+				"collection contains duplicates, and it is not retried automatically. Fix the data, then delete "+
+				"this migration's record from the schema_migrations collection and restart a server. "+
+				"The record lists the affected indexes",
 				migrationTag)
-			return indexMigrationSkippedAfterErrors
+			return indexMigrationBlocked
+		case state == indexMigrationWaitingForRetry:
+			if !loggedWaiting {
+				loggedWaiting = true
+				m.logger.Warn("MongoDB index migration ended with errors earlier; it is retried after its backoff. "+
+					"See the schema_migrations collection for details",
+					migrationTag)
+			}
 		}
 
 		select {
@@ -345,7 +402,11 @@ func (m *indexMigrator) tryAcquire(ctx context.Context, id string) (indexMigrati
 			"_id": id,
 			"$or": bson.A{
 				bson.M{"status": indexMigrationStatusRunning, "lease_until": bson.M{"$lt": now}},
-				bson.M{"status": indexMigrationStatusCompletedWithErrors, "finished_at": bson.M{"$lte": now.Add(-m.retryBackoff)}},
+				bson.M{
+					"status":         indexMigrationStatusCompletedWithErrors,
+					"needs_operator": bson.M{"$ne": true},
+					"finished_at":    bson.M{"$lte": now.Add(-m.retryBackoff)},
+				},
 			},
 		},
 		bson.M{
@@ -376,7 +437,10 @@ func (m *indexMigrator) tryAcquire(ctx context.Context, id string) (indexMigrati
 	case indexMigrationStatusCompleted:
 		return indexMigrationDone, nil
 	case indexMigrationStatusCompletedWithErrors:
-		return indexMigrationFailedRecently, nil
+		if doc.NeedsOperator {
+			return indexMigrationNeedsOperator, nil
+		}
+		return indexMigrationWaitingForRetry, nil
 	default:
 		return indexMigrationHeldByOther, nil
 	}
@@ -420,11 +484,15 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	}
 
 	status := indexMigrationStatusCompleted
+	needsOperator := false
 	var notCreated []string
 	for _, result := range results {
 		if !result.ok() {
 			status = indexMigrationStatusCompletedWithErrors
 			notCreated = append(notCreated, result.Collection+"."+result.Name)
+		}
+		if result.Outcome == indexOutcomeDuplicateData {
+			needsOperator = true
 		}
 	}
 
@@ -432,10 +500,11 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	res, err := m.db.Collection(collectionSchemaMigrations).UpdateOne(ctx,
 		bson.M{"_id": migration.ID, "owner": m.owner},
 		bson.M{"$set": bson.M{
-			"status":      status,
-			"finished_at": now,
-			"lease_until": now,
-			"indexes":     results,
+			"status":         status,
+			"finished_at":    now,
+			"lease_until":    now,
+			"needs_operator": needsOperator,
+			"indexes":        results,
 		}},
 	)
 	switch {
@@ -457,7 +526,7 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 
 func (r indexMigrationResult) ok() bool {
 	switch r.Outcome {
-	case indexOutcomeCreated, indexOutcomeExists, indexOutcomeExistsOtherName:
+	case indexOutcomeCreated, indexOutcomeExists, indexOutcomeExistsOtherName, indexOutcomeSkippedUnsupported:
 		return true
 	default:
 		return false
@@ -494,17 +563,56 @@ func (m *indexMigrator) logIndexResult(migrationID string, result indexMigration
 	}
 }
 
-// ensureIndex puts one index in place and reports what it did. It never
-// modifies an existing index and only drops the indexes named in Replaces.
+// ensureIndex puts one index in place and reports what it did. A transient
+// error (network, primary change) is retried a few times before the index is
+// given up for this run.
 func (m *indexMigrator) ensureIndex(ctx context.Context, def indexDefinition) indexMigrationResult {
+	for attempt := 1; ; attempt++ {
+		result, err := m.ensureIndexOnce(ctx, def)
+		if err == nil || ctx.Err() != nil || attempt >= m.buildAttempts || !isRetryableIndexBuildError(err) {
+			return result
+		}
+		m.logger.Warn("MongoDB index migration: transient error, retrying the index",
+			tag.NewStringTag("collection", def.Collection),
+			tag.NewStringTag("index", def.Name),
+			tag.NewInt("attempt", attempt),
+			tag.Error(err))
+		select {
+		case <-ctx.Done():
+			return result
+		case <-time.After(time.Duration(attempt) * m.buildRetryInterval):
+		}
+	}
+}
+
+// ensureIndexOnce makes one attempt at an index. It never modifies an existing
+// index and only drops the indexes named in Replaces. The error is the one
+// behind a failed outcome, for the caller to decide about a retry.
+func (m *indexMigrator) ensureIndexOnce(ctx context.Context, def indexDefinition) (indexMigrationResult, error) {
 	result := indexMigrationResult{Collection: def.Collection, Name: def.Name}
 	col := m.db.Collection(def.Collection)
+
+	if len(def.MinServerVersion) > 0 {
+		version, err := m.getServerVersion(ctx)
+		if err != nil {
+			result.Outcome = indexOutcomeFailed
+			result.Error = err.Error()
+			return result, err
+		}
+		if versionLess(version, def.MinServerVersion) {
+			result.Outcome = indexOutcomeSkippedUnsupported
+			result.Notes = append(result.Notes, fmt.Sprintf(
+				"the index needs MongoDB %s or later, the server is %s",
+				formatVersion(def.MinServerVersion), formatVersion(version)))
+			return result, nil
+		}
+	}
 
 	existing, err := listExistingIndexes(ctx, col)
 	if err != nil {
 		result.Outcome = indexOutcomeFailed
 		result.Error = err.Error()
-		return result
+		return result, err
 	}
 
 	// Pick the name: the intended one, or the prefixed one if the intended
@@ -519,7 +627,7 @@ func (m *indexMigrator) ensureIndex(ctx context.Context, def indexDefinition) in
 		if sameName != nil && !def.matches(*sameName) {
 			result.Outcome = indexOutcomeConflict
 			result.Error = fmt.Sprintf("index names %q and %q are both used by different indexes", def.Name, target)
-			return result
+			return result, nil
 		}
 	}
 
@@ -531,10 +639,13 @@ func (m *indexMigrator) ensureIndex(ctx context.Context, def indexDefinition) in
 		result.Outcome = indexOutcomeExistsOtherName
 		result.CreatedAs = equivalent.Name
 	default:
+		m.logger.Info("MongoDB index migration: building index",
+			tag.NewStringTag("collection", def.Collection),
+			tag.NewStringTag("index", target))
 		if _, err := col.Indexes().CreateOne(ctx, def.model(target)); err != nil {
 			result.Outcome = classifyIndexBuildError(err)
 			result.Error = err.Error()
-			return result
+			return result, err
 		}
 		result.Outcome = indexOutcomeCreated
 		result.CreatedAs = target
@@ -561,7 +672,124 @@ func (m *indexMigrator) ensureIndex(ctx context.Context, def indexDefinition) in
 		result.Dropped = append(result.Dropped, oldName)
 	}
 
-	return result
+	return result, nil
+}
+
+// report lists the indexes of the migration that are not in place, without
+// building anything. It is what a server does when index migrations are
+// disabled in its configuration.
+func (m *indexMigrator) report(ctx context.Context, migration indexMigration) []string {
+	migrationTag := tag.NewStringTag("migration", migration.ID)
+	var missing []string
+	for _, def := range migration.Indexes {
+		if len(def.MinServerVersion) > 0 {
+			version, err := m.getServerVersion(ctx)
+			if err == nil && versionLess(version, def.MinServerVersion) {
+				continue
+			}
+		}
+		existing, err := listExistingIndexes(ctx, m.db.Collection(def.Collection))
+		if err != nil {
+			if ctx.Err() == nil {
+				m.logger.Warn("MongoDB index migration is disabled and the indexes could not be checked",
+					migrationTag, tag.Error(err))
+			}
+			return nil
+		}
+		if findEquivalentIndex(existing, def) == nil {
+			missing = append(missing, def.Collection+"."+def.Name)
+		}
+	}
+
+	if len(missing) == 0 {
+		m.logger.Info("MongoDB index migration is disabled; all its indexes are in place", migrationTag)
+		return nil
+	}
+	m.logger.Warn("MongoDB index migration is disabled and some indexes are missing. Queries that need them "+
+		"scan their collection. Build them with schema/mongodb/temporal/versioned/v1.0/init.js",
+		migrationTag, tag.NewStringsTag("missing-indexes", missing))
+	return missing
+}
+
+// getServerVersion returns the version of the MongoDB server as numbers.
+func (m *indexMigrator) getServerVersion(ctx context.Context) ([]int, error) {
+	if m.serverVersion != nil {
+		return m.serverVersion, nil
+	}
+	var info struct {
+		VersionArray []int32 `bson:"versionArray"`
+	}
+	if err := m.db.RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info); err != nil {
+		return nil, err
+	}
+	if len(info.VersionArray) == 0 {
+		return nil, errors.New("the server did not report its version")
+	}
+	version := make([]int, len(info.VersionArray))
+	for i, part := range info.VersionArray {
+		version[i] = int(part)
+	}
+	m.serverVersion = version
+	return version, nil
+}
+
+func versionLess(version, minimum []int) bool {
+	for i, want := range minimum {
+		have := 0
+		if i < len(version) {
+			have = version[i]
+		}
+		if have != want {
+			return have < want
+		}
+	}
+	return false
+}
+
+func formatVersion(version []int) string {
+	parts := make([]string, len(version))
+	for i, part := range version {
+		parts[i] = strconv.Itoa(part)
+	}
+	return strings.Join(parts, ".")
+}
+
+// Server error codes that mean "try again": the node is shutting down or is
+// no longer primary, the operation was interrupted by such a change, or it
+// lost a lock or write conflict.
+var retryableIndexBuildCodes = []int{
+	24,    // LockTimeout
+	91,    // ShutdownInProgress
+	112,   // WriteConflict
+	189,   // PrimarySteppedDown
+	262,   // ExceededTimeLimit
+	276,   // IndexBuildAborted
+	10107, // NotWritablePrimary
+	11600, // InterruptedAtShutdown
+	11602, // InterruptedDueToReplStateChange
+	13435, // NotPrimaryNoSecondaryOk
+	13436, // NotPrimaryOrSecondary
+}
+
+// isRetryableIndexBuildError reports whether an index operation failed for a
+// reason that another attempt may not hit.
+func isRetryableIndexBuildError(err error) bool {
+	if mongo.IsNetworkError(err) || mongo.IsTimeout(err) {
+		return true
+	}
+	var serverErr mongo.ServerError
+	if !errors.As(err, &serverErr) {
+		return false
+	}
+	if serverErr.HasErrorLabel("RetryableWriteError") {
+		return true
+	}
+	for _, code := range retryableIndexBuildCodes {
+		if serverErr.HasErrorCode(code) {
+			return true
+		}
+	}
+	return false
 }
 
 func (def indexDefinition) model(name string) mongo.IndexModel {
@@ -679,13 +907,17 @@ func (m *indexMigrator) renewLease(ctx context.Context, id string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, err := m.db.Collection(collectionSchemaMigrations).UpdateOne(ctx,
+			res, err := m.db.Collection(collectionSchemaMigrations).UpdateOne(ctx,
 				bson.M{"_id": id, "owner": m.owner, "status": indexMigrationStatusRunning},
 				bson.M{"$set": bson.M{"lease_until": m.now().Add(m.lease)}},
 			)
-			if err != nil && ctx.Err() == nil {
+			switch {
+			case err != nil && ctx.Err() == nil:
 				m.logger.Warn("MongoDB index migration could not renew its lease",
 					tag.NewStringTag("migration", id), tag.Error(err))
+			case err == nil && res.MatchedCount == 0:
+				m.logger.Warn("MongoDB index migration no longer holds its lease; another process may have taken it over",
+					tag.NewStringTag("migration", id))
 			}
 		}
 	}
