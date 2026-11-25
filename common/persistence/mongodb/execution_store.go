@@ -2388,9 +2388,9 @@ func (s *executionStore) AddHistoryTasks(
 					return nil, err
 				}
 				if duplicate {
-					// A duplicate key error aborts the MongoDB transaction. The
-					// batch is written atomically, so an existing task means an
-					// earlier attempt of this request already committed.
+					// A duplicate key error aborts the MongoDB transaction, so
+					// nothing of this attempt is written. Leave the transaction
+					// and find out below whether the whole batch is there.
 					return nil, errHistoryTasksAlreadyPersisted
 				}
 			}
@@ -2399,9 +2399,59 @@ func (s *executionStore) AddHistoryTasks(
 		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 	if errors.Is(err, errHistoryTasksAlreadyPersisted) {
-		return nil
+		// The batch is written atomically, so if an earlier attempt of this
+		// request committed, every task of it exists and the request is done.
+		// Anything else is a task key collision with a different write: this
+		// batch was not written, and reporting success would lose its tasks.
+		persisted, checkErr := s.historyTasksPersisted(ctx, request)
+		if checkErr != nil {
+			return checkErr
+		}
+		if persisted {
+			return nil
+		}
+		return serviceerror.NewUnavailablef(
+			"history task already exists and the batch was not written. shard: %v", request.ShardID)
 	}
 	return err
+}
+
+// historyTasksPersisted reports whether every task of the request exists.
+func (s *executionStore) historyTasksPersisted(
+	ctx context.Context,
+	request *persistence.InternalAddHistoryTasksRequest,
+) (bool, error) {
+	for category, taskList := range request.Tasks {
+		if len(taskList) == 0 {
+			continue
+		}
+		col, categoryID, categoryType, err := s.taskCollectionForCategory(category)
+		if err != nil {
+			return false, err
+		}
+
+		ids := make([]string, 0, len(taskList))
+		seen := make(map[string]struct{}, len(taskList))
+		for _, task := range taskList {
+			id := immediateDocIDForKey(request.ShardID, categoryID, task.Key)
+			if categoryType == taskspkg.CategoryTypeScheduled {
+				id = scheduledDocIDForKey(request.ShardID, categoryID, task.Key)
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
+		}
+
+		count, err := col.CountDocuments(ctx, bson.M{"_id": bson.M{"$in": ids}})
+		if err != nil {
+			return false, serviceerror.NewUnavailablef("failed to check history tasks: %v", err)
+		}
+		if count != int64(len(ids)) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *executionStore) GetHistoryTasks(
@@ -3191,14 +3241,22 @@ var errHistoryTasksAlreadyPersisted = errors.New("history tasks already persiste
 // document, conditional on range_id, closes that gap: if the range moved
 // before this transaction started the filter does not match, and if it moved
 // while the transaction was open the write conflicts and the transaction is
-// retried, after which the read half reports the ownership loss. This matches
-// the SQL stores (shared lock on the shard row) and Cassandra (IF range_id = ?
-// in every batch).
+// retried, after which the read half reports the ownership loss. This gives the
+// guarantee of the SQL stores (shared lock on the shard row) and of Cassandra
+// (IF range_id = ? in every batch).
 //
 // The update is a $inc rather than a no-op $set because an update that changes
-// nothing does not take part in conflict detection. Running it last keeps the
-// shard document locked only until commit, which limits conflicts between
-// concurrent transactions of the same shard.
+// nothing does not take part in conflict detection.
+//
+// Concurrency differs from SQL. A shared lock lets transactions of one shard
+// run in parallel; here every transaction writes the shard document, so two
+// transactions of the same shard whose snapshot-to-commit intervals overlap
+// conflict, and the loser is retried (see executeTransaction). The history
+// service must therefore run one persistence operation per shard at a time,
+// which is what history.shardIOConcurrency = 1 does; the shard context
+// enforces that value for MongoDB as it does for Cassandra. Running the write
+// last does not avoid such conflicts. It keeps the shard document locked only
+// until commit, so UpdateShard is not held up for the whole transaction.
 func (s *executionStore) fenceShardRangeID(
 	ctx context.Context,
 	shardID int32,
