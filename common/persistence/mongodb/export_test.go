@@ -108,3 +108,9 @@ func HistoryNodeQueryForTest(
 func HistoryNodeDocIDForTest(treeID, branchID string, nodeID, txnID int64) string {
 	return historyNodeDocID(treeID, branchID, nodeID, txnID)
 }
+
+// IsRetryableIndexBuildErrorForTest reports whether a failed index build is
+// retried.
+func IsRetryableIndexBuildErrorForTest(err error) bool {
+	return isRetryableIndexBuildError(err)
+}

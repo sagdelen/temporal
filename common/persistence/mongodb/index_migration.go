@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -114,6 +115,10 @@ const (
 	indexMigrationBlocked indexMigrationOutcome = "blocked_needs_operator"
 	// indexMigrationInterrupted: the context was cancelled before the migration finished.
 	indexMigrationInterrupted indexMigrationOutcome = "interrupted"
+	// indexMigrationNotRecorded: this run lost its lease, or could not record
+	// its result. The migration is not finished as far as the cluster knows,
+	// so the runner goes back to waiting for it. Never returned by run.
+	indexMigrationNotRecorded indexMigrationOutcome = "not_recorded"
 )
 
 type (
@@ -159,8 +164,9 @@ type (
 		LeaseUntil time.Time  `bson:"lease_until"`
 		StartedAt  time.Time  `bson:"started_at"`
 		FinishedAt *time.Time `bson:"finished_at,omitempty"`
-		// NeedsOperator is set when the migration ended with an error that a
-		// retry cannot fix (duplicate data under a unique index).
+		// NeedsOperator is set when the migration ended with errors and none
+		// of them is one a retry can fix: every index that is not in place is
+		// blocked by duplicate data under a unique index.
 		NeedsOperator bool                   `bson:"needs_operator,omitempty"`
 		Indexes       []indexMigrationResult `bson:"indexes,omitempty"`
 	}
@@ -349,7 +355,11 @@ func (m *indexMigrator) run(ctx context.Context, migration indexMigration) index
 			m.logger.Warn("MongoDB index migration could not read or take its lease, will retry",
 				migrationTag, tag.Error(err))
 		case state == indexMigrationAcquired:
-			return m.execute(ctx, migration)
+			if outcome := m.execute(ctx, migration); outcome != indexMigrationNotRecorded {
+				return outcome
+			}
+			// Another process owns the migration now, or the result could
+			// not be written: keep watching it like any other waiting runner.
 		case state == indexMigrationDone:
 			m.logger.Debug("MongoDB index migration already completed", migrationTag)
 			return indexMigrationAlreadyCompleted
@@ -450,22 +460,40 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	migrationTag := tag.NewStringTag("migration", migration.ID)
 	m.logger.Info("MongoDB index migration started", migrationTag, tag.NewInt("indexes", len(migration.Indexes)))
 
+	// Indexes blocked by duplicate data in an earlier attempt stay blocked
+	// until an operator deletes the record: building them again would scan
+	// the collection only to fail the same way.
+	blocked := m.blockedIndexResults(ctx, migration.ID)
+
+	// The builds stop when the lease is lost: the process that took the
+	// migration over is the one building from then on.
+	buildCtx, stopBuilding := context.WithCancel(ctx)
+	defer stopBuilding()
+	var leaseLost atomic.Bool
+
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		m.renewLease(heartbeatCtx, migration.ID)
+		m.renewLease(heartbeatCtx, migration.ID, func() {
+			leaseLost.Store(true)
+			stopBuilding()
+		})
 	}()
 
 	results := make([]indexMigrationResult, 0, len(migration.Indexes))
 	interrupted := false
 	for _, def := range migration.Indexes {
-		if ctx.Err() != nil {
+		if buildCtx.Err() != nil {
 			interrupted = true
 			break
 		}
-		result := m.ensureIndex(ctx, def)
-		if ctx.Err() != nil {
+		if result, ok := blocked[def.Collection+"."+def.Name]; ok {
+			results = append(results, result)
+			continue
+		}
+		result := m.ensureIndex(buildCtx, def)
+		if buildCtx.Err() != nil {
 			// The result of an interrupted call says nothing about the index.
 			interrupted = true
 			break
@@ -477,6 +505,11 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	stopHeartbeat()
 	<-heartbeatDone
 
+	if leaseLost.Load() {
+		m.logger.Warn("MongoDB index migration lost its lease while building; it stops here and "+
+			"leaves the migration to the process that took it over", migrationTag)
+		return indexMigrationNotRecorded
+	}
 	if interrupted {
 		m.releaseLease(migration.ID)
 		m.logger.Info("MongoDB index migration interrupted, it continues on a later start", migrationTag)
@@ -484,17 +517,24 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	}
 
 	status := indexMigrationStatusCompleted
-	needsOperator := false
+	blockedIndexes, retryableIndexes := 0, 0
 	var notCreated []string
 	for _, result := range results {
-		if !result.ok() {
-			status = indexMigrationStatusCompletedWithErrors
-			notCreated = append(notCreated, result.Collection+"."+result.Name)
+		if result.ok() {
+			continue
 		}
+		status = indexMigrationStatusCompletedWithErrors
+		notCreated = append(notCreated, result.Collection+"."+result.Name)
 		if result.Outcome == indexOutcomeDuplicateData {
-			needsOperator = true
+			blockedIndexes++
+		} else {
+			retryableIndexes++
 		}
 	}
+	// While an index is left that a retry may fix, the servers keep retrying
+	// the migration. Only when duplicate data is all that is left does it wait
+	// for an operator.
+	needsOperator := blockedIndexes > 0 && retryableIndexes == 0
 
 	now := m.now()
 	res, err := m.db.Collection(collectionSchemaMigrations).UpdateOne(ctx,
@@ -509,9 +549,12 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 	)
 	switch {
 	case err != nil:
-		m.logger.Warn("MongoDB index migration could not record its result", migrationTag, tag.Error(err))
+		m.logger.Warn("MongoDB index migration could not record its result; it is picked up again "+
+			"once its lease has expired", migrationTag, tag.Error(err))
+		return indexMigrationNotRecorded
 	case res.MatchedCount == 0:
 		m.logger.Warn("MongoDB index migration lost its lease before recording its result", migrationTag)
+		return indexMigrationNotRecorded
 	}
 
 	if status == indexMigrationStatusCompleted {
@@ -522,6 +565,23 @@ func (m *indexMigrator) execute(ctx context.Context, migration indexMigration) i
 		"See the schema_migrations collection for details",
 		migrationTag, tag.NewStringsTag("indexes-not-created", notCreated))
 	return indexMigrationCompletedWithErrors
+}
+
+// blockedIndexResults returns the results of the indexes that an earlier
+// attempt of the migration found blocked by duplicate data, keyed by
+// "collection.name". Without a readable record nothing is blocked.
+func (m *indexMigrator) blockedIndexResults(ctx context.Context, id string) map[string]indexMigrationResult {
+	var doc indexMigrationDocument
+	if err := m.db.Collection(collectionSchemaMigrations).FindOne(ctx, bson.M{"_id": id}).Decode(&doc); err != nil {
+		return nil
+	}
+	blocked := make(map[string]indexMigrationResult)
+	for _, result := range doc.Indexes {
+		if result.Outcome == indexOutcomeDuplicateData {
+			blocked[result.Collection+"."+result.Name] = result
+		}
+	}
+	return blocked
 }
 
 func (r indexMigrationResult) ok() bool {
@@ -758,14 +818,20 @@ func formatVersion(version []int) string {
 // no longer primary, the operation was interrupted by such a change, or it
 // lost a lock or write conflict.
 var retryableIndexBuildCodes = []int{
+	6,     // HostUnreachable
+	7,     // HostNotFound
 	24,    // LockTimeout
+	89,    // NetworkTimeout
 	91,    // ShutdownInProgress
 	112,   // WriteConflict
 	189,   // PrimarySteppedDown
 	262,   // ExceededTimeLimit
 	276,   // IndexBuildAborted
+	285,   // IndexBuildAlreadyInProgress
+	9001,  // SocketException
 	10107, // NotWritablePrimary
 	11600, // InterruptedAtShutdown
+	11601, // Interrupted
 	11602, // InterruptedDueToReplStateChange
 	13435, // NotPrimaryNoSecondaryOk
 	13436, // NotPrimaryOrSecondary
@@ -898,8 +964,9 @@ func classifyIndexBuildError(err error) string {
 	return indexOutcomeFailed
 }
 
-// renewLease extends the lease until ctx is cancelled.
-func (m *indexMigrator) renewLease(ctx context.Context, id string) {
+// renewLease extends the lease until ctx is cancelled. When the lease turns
+// out to belong to another process it calls onLost and returns.
+func (m *indexMigrator) renewLease(ctx context.Context, id string, onLost func()) {
 	ticker := time.NewTicker(m.heartbeat)
 	defer ticker.Stop()
 	for {
@@ -916,8 +983,8 @@ func (m *indexMigrator) renewLease(ctx context.Context, id string) {
 				m.logger.Warn("MongoDB index migration could not renew its lease",
 					tag.NewStringTag("migration", id), tag.Error(err))
 			case err == nil && res.MatchedCount == 0:
-				m.logger.Warn("MongoDB index migration no longer holds its lease; another process may have taken it over",
-					tag.NewStringTag("migration", id))
+				onLost()
+				return
 			}
 		}
 	}
