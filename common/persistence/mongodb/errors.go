@@ -6,7 +6,15 @@ import (
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.temporal.io/api/serviceerror"
+	"google.golang.org/grpc/status"
 )
+
+// isServiceError reports whether err is (or wraps) a Temporal service error,
+// i.e. one that carries a gRPC status.
+func isServiceError(err error) bool {
+	var svcErr interface{ Status() *status.Status }
+	return errors.As(err, &svcErr)
+}
 
 // isDuplicateIndexError reports whether the provided error corresponds to a duplicate index creation attempt.
 // Mongo surfaces these through mongo.CommandError (code 85) or duplicate key error (11000) depending on context.
