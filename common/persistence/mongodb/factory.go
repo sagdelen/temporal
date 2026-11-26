@@ -283,8 +283,10 @@ func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
 
 	metadataStore, err := NewMetadataStore(
 		f.database,
+		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
