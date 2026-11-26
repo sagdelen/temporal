@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -125,7 +127,7 @@ func (m *metadataStore) CreateNamespace(
 		return nil, err
 	}
 
-	_, err := m.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+	_, err := m.executeNamespaceTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 		version, err := m.incrementMetadata(sessCtx)
 		if err != nil {
 			return nil, err
@@ -243,7 +245,7 @@ func (m *metadataStore) updateNamespace(
 
 	// The metadata version check and bump come first, as in SQL, and the
 	// namespace write commits only together with it.
-	_, err := m.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+	_, err := m.executeNamespaceTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 		result, err := m.db.Collection(collectionNamespaceMetadata).UpdateOne(sessCtx,
 			bson.M{"_id": namespaceMetadataDocumentID, "notification_version": request.NotificationVersion},
 			bson.M{"$inc": bson.M{"notification_version": int64(1)}},
@@ -386,6 +388,44 @@ func (m *metadataStore) getOrCreateMetadata(ctx context.Context) (*namespaceMeta
 	}
 
 	return &doc, nil
+}
+
+// Namespace writes all conflict on the one metadata document. SQL queues them
+// on its row lock, so none fails because others ran at the same time. A
+// transaction that keeps losing the conflict is therefore started again a few
+// more times, after a jittered pause. Namespace writes are rare, so this costs
+// nothing in practice.
+const (
+	maxNamespaceTransactionRounds = 20
+	namespaceTransactionBackoff   = 10 * time.Millisecond
+)
+
+func (m *metadataStore) executeNamespaceTransaction(ctx context.Context, fn func(context.Context) (interface{}, error)) (interface{}, error) {
+	for round := 1; ; round++ {
+		result, err := m.executeTransaction(ctx, fn)
+		if err == nil || round >= maxNamespaceTransactionRounds || !isTransactionConflictError(err) {
+			return result, err
+		}
+		pause := namespaceTransactionBackoff + time.Duration(rand.Int63n(int64(namespaceTransactionBackoff)*int64(round)))
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(pause):
+		}
+	}
+}
+
+// isTransactionConflictError reports whether err says that a transaction was
+// aborted by write conflicts and not committed.
+func isTransactionConflictError(err error) bool {
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) && serverErr.HasErrorLabel("TransientTransactionError") {
+		return true
+	}
+	// executeTransaction reports a transaction it stopped retrying as
+	// ResourceExhausted.
+	var exhausted *serviceerror.ResourceExhausted
+	return errors.As(err, &exhausted) && strings.Contains(exhausted.Message, "write conflict")
 }
 
 // incrementMetadata advances the metadata version inside a transaction and
