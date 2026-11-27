@@ -1130,8 +1130,8 @@ type MongoDB struct {
     ConnectTimeout  time.Duration `yaml:"connectTimeout"`
     TLS             *TLS          `yaml:"tls"`
     ReplicaSet      string        `yaml:"replicaSet"`      // For transaction support
-    ReadPreference  string        `yaml:"readPreference"`  // primary, secondary, etc.
-    WriteConcern    string        `yaml:"writeConcern"`    // majority, w1, etc.
+    ReadPreference  string        `yaml:"readPreference"`  // ignored (warning); reads use the primary
+    WriteConcern    string        `yaml:"writeConcern"`    // ignored (warning); the deployment's default applies
 }
 
 // Add to DataStore struct
@@ -1185,8 +1185,6 @@ persistence:
         maxConns: 100
         connectTimeout: 10s
         replicaSet: "rs0" # Enables transaction support
-        readPreference: "primary"
-        writeConcern: "majority"
         tls:
           enabled: true
           certFile: "/path/to/client.pem"
@@ -1213,8 +1211,6 @@ persistence:
         connectTimeout: 15s
         # No replicaSet for sharded clusters
         # Transactions supported across shards (MongoDB 4.2+)
-        readPreference: "primary"
-        writeConcern: "majority"
                 tls:
                     enabled: true
 ```
