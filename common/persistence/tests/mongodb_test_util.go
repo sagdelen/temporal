@@ -96,8 +96,6 @@ func NewMongoDBConfig() *config.MongoDB {
 		MaxConns:       20,
 		ConnectTimeout: 10 * time.Second,
 		ReplicaSet:     environment.GetMongoDBReplicaSet(),
-		ReadPreference: "primary",
-		WriteConcern:   "majority",
 	}
 }
 
