@@ -611,14 +611,10 @@ func (s *taskStore) GetTasks(
 	}
 
 	if s.fairnessEnabled {
-		if request.InclusiveMinPass == 0 {
-			if err := s.applyStandardGetTasksFilter(filter, request); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := s.applyFairGetTasksFilter(filter, request); err != nil {
-				return nil, err
-			}
+		// Classic (pass 0) tasks share the collection; a fair read must never
+		// return them (same as sql/task_v2.go, which rejects pass < 1).
+		if err := s.applyFairGetTasksFilter(filter, request); err != nil {
+			return nil, err
 		}
 		return s.findTasks(ctx, filter, limit, true)
 	}
@@ -645,18 +641,15 @@ func (s *taskStore) CompleteTasksLessThan(
 	}
 
 	if s.fairnessEnabled {
-		if request.ExclusiveMaxPass == 0 {
-			// V1 request - delete tasks with TaskPass=0
-			filter["task_pass"] = int64(0)
-			if request.ExclusiveMaxTaskID > 0 {
-				filter["task_id"] = bson.M{"$lt": request.ExclusiveMaxTaskID}
-			}
-		} else {
-			// V2 request - delete tasks less than <Pass, TaskID>
-			filter["$or"] = []bson.M{
-				{"task_pass": bson.M{"$lt": request.ExclusiveMaxPass}},
-				{"task_pass": request.ExclusiveMaxPass, "task_id": bson.M{"$lt": request.ExclusiveMaxTaskID}},
-			}
+		// Require starting from pass 1, as sql/task_v2.go does. Classic and fair
+		// tasks share the collection, so the lower bound on task_pass keeps a
+		// fair delete from removing the classic (pass 0) tasks of the same queue.
+		if request.ExclusiveMaxPass < 1 {
+			return 0, serviceerror.NewInternal("invalid CompleteTasksLessThan request on fair queue")
+		}
+		filter["$or"] = []bson.M{
+			{"task_pass": bson.M{"$gte": int64(1), "$lt": request.ExclusiveMaxPass}},
+			{"task_pass": request.ExclusiveMaxPass, "task_id": bson.M{"$lt": request.ExclusiveMaxTaskID}},
 		}
 	} else {
 		if request.ExclusiveMaxPass != 0 {
