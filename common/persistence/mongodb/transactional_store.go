@@ -113,6 +113,10 @@ func normalizeTransactionError(err error) error {
 	if isTransientWriteConflict(err) {
 		return newTransactionConflictError(err)
 	}
+	if isSizeLimitError(err) {
+		// Nothing was committed, and retrying the same write cannot succeed.
+		return newSizeLimitError(err)
+	}
 	var serverErr mongo.ServerError
 	if errors.As(err, &serverErr) {
 		return serviceerror.NewUnavailablef("mongodb transaction failed: %v", err)
