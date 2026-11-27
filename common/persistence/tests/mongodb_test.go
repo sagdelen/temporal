@@ -6,9 +6,11 @@ import (
 
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/server/common/config"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/persistence"
 	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
 	"go.temporal.io/server/common/persistence/serialization"
+	"go.temporal.io/server/common/primitives"
 )
 
 type mongoPersistenceTestCluster struct {
@@ -30,6 +32,7 @@ func (c *mongoPersistenceTestCluster) Config() config.Persistence {
 				MongoDB: c.cfg,
 			},
 		},
+		TransactionSizeLimit: dynamicconfig.GetIntPropertyFn(primitives.DefaultTransactionSizeLimit),
 	}
 }
 
@@ -247,6 +250,19 @@ func TestMongoDBQueuePersistence(t *testing.T) {
 	testCluster := newMongoPersistenceTestCluster(testData.Cfg)
 
 	s := new(persistencetests.QueuePersistenceSuite)
+	s.TestBase = persistencetests.NewTestBaseForCluster(testCluster, testData.Logger)
+	s.Setup(nil)
+
+	suite.Run(t, s)
+}
+
+func TestMongoDBHistoryV2PersistenceSuite(t *testing.T) {
+	testData, tearDown := setUpMongoDBTest(t)
+	t.Cleanup(tearDown)
+
+	testCluster := newMongoPersistenceTestCluster(testData.Cfg)
+
+	s := new(persistencetests.HistoryV2PersistenceSuite)
 	s.TestBase = persistencetests.NewTestBaseForCluster(testCluster, testData.Logger)
 	s.Setup(nil)
 
