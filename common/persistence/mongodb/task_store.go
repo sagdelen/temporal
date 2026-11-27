@@ -6,15 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 )
@@ -28,6 +31,7 @@ const (
 
 type (
 	taskStore struct {
+		transactionalStore
 		db                  client.Database
 		mongoClient         client.Client
 		cfg                 config.MongoDB
@@ -85,10 +89,12 @@ func newMongoTaskStore(
 	mongoClient client.Client,
 	cfg config.MongoDB,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 	transactionsEnabled bool,
 	fairnessEnabled bool,
 ) (persistence.TaskStore, error) {
 	store := &taskStore{
+		transactionalStore:  newTransactionalStore(mongoClient, metricsHandler),
 		db:                  db,
 		mongoClient:         mongoClient,
 		cfg:                 cfg,
@@ -113,9 +119,10 @@ func NewTaskStore(
 	mongoClient client.Client,
 	cfg config.MongoDB,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 	transactionsEnabled bool,
 ) (persistence.TaskStore, error) {
-	return newMongoTaskStore(db, mongoClient, cfg, logger, transactionsEnabled, false)
+	return newMongoTaskStore(db, mongoClient, cfg, logger, metricsHandler, transactionsEnabled, false)
 }
 
 // NewFairTaskStore returns a new MongoDB TaskStore implementation with fairness enabled.
@@ -124,9 +131,10 @@ func NewFairTaskStore(
 	mongoClient client.Client,
 	cfg config.MongoDB,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 	transactionsEnabled bool,
 ) (persistence.TaskStore, error) {
-	return newMongoTaskStore(db, mongoClient, cfg, logger, transactionsEnabled, true)
+	return newMongoTaskStore(db, mongoClient, cfg, logger, metricsHandler, transactionsEnabled, true)
 }
 
 func (s *taskStore) GetName() string {
@@ -421,10 +429,15 @@ func (s *taskStore) ListTaskQueue(
 		limit = 100
 	}
 
-	filter := bson.M{}
+	// Classic and fair task queues share the collection and differ only in the
+	// version suffix of their _id. List only this store's queues, as the SQL
+	// stores do with their separate tables; the task queue scavenger lists each
+	// store and would otherwise treat the other store's queues as its own.
+	idFilter := bson.M{"$regex": primitive.Regex{Pattern: regexp.QuoteMeta(taskQueueVersionSuffix(s.fairnessEnabled)) + "$"}}
 	if len(request.PageToken) > 0 {
-		filter["_id"] = bson.M{"$gt": string(request.PageToken)}
+		idFilter["$gt"] = string(request.PageToken)
 	}
+	filter := bson.M{"_id": idFilter}
 
 	opts := options.Find().SetLimit(limit).SetSort(bson.D{{Key: "_id", Value: 1}})
 
@@ -540,14 +553,7 @@ func (s *taskStore) CreateTasks(
 	}
 
 	// Execute in a transaction for atomicity
-	sess, err := s.mongoClient.StartSession(ctx)
-	if err != nil {
-		return nil, serviceerror.NewUnavailablef("CreateTasks: failed to start session: %v", err)
-	}
-	defer sess.EndSession(ctx)
-
-	var response *persistence.CreateTasksResponse
-	_, txErr := sess.WithTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+	_, txErr := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 		// Step 1: Verify RangeID FIRST (write fence)
 		queueFilter := bson.M{"_id": queueID, "range_id": request.RangeID}
 		queueUpdate := bson.M{"$set": bson.M{
@@ -558,7 +564,8 @@ func (s *taskStore) CreateTasks(
 
 		res, err := s.db.Collection(collectionTaskQueues).UpdateOne(sessCtx, queueFilter, queueUpdate)
 		if err != nil {
-			return nil, serviceerror.NewUnavailablef("CreateTasks: failed to update queue: %v", err)
+			// Returned as is, so a write conflict keeps its retry label.
+			return nil, err
 		}
 		if res.MatchedCount == 0 {
 			// RangeID mismatch - transaction will abort, no tasks written
@@ -567,23 +574,20 @@ func (s *taskStore) CreateTasks(
 
 		// Step 2: Insert all tasks in one batch operation
 		tasksColl := s.db.Collection(collectionTasks)
-		_, err = tasksColl.InsertMany(sessCtx, taskDocs)
-		if err != nil {
+		if _, err := tasksColl.InsertMany(sessCtx, taskDocs); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
 				return nil, &persistence.ConditionFailedError{Msg: "task already exists"}
 			}
-			return nil, serviceerror.NewUnavailablef("CreateTasks: batch insert failed: %v", err)
+			// Returned as is, so a write conflict keeps its retry label.
+			return nil, err
 		}
-
-		response = &persistence.CreateTasksResponse{UpdatedMetadata: true}
 		return nil, nil
 	})
-
 	if txErr != nil {
-		return nil, txErr
+		return nil, taskStoreTxError("CreateTasks", txErr)
 	}
 
-	return response, nil
+	return &persistence.CreateTasksResponse{UpdatedMetadata: true}, nil
 }
 
 func (s *taskStore) GetTasks(
@@ -664,16 +668,73 @@ func (s *taskStore) CompleteTasksLessThan(
 		}
 	}
 
-	res, err := s.db.Collection(collectionTasks).DeleteMany(ctx, filter)
+	deleted, err := s.deleteTasks(ctx, filter, request.Limit)
 	if err != nil {
 		return 0, serviceerror.NewUnavailablef("CompleteTasksLessThan failed: %v", err)
 	}
+	return deleted, nil
+}
 
-	if request.Limit > 0 && res.DeletedCount > int64(request.Limit) {
-		return request.Limit, nil
+// deleteTasks deletes the tasks matching filter, at most limit of them in task
+// order when limit is positive, as the SQL stores do. An unbounded delete of a
+// large backlog would be one huge write, and inside the fair path's
+// transaction it could exceed the transaction limits.
+func (s *taskStore) deleteTasks(ctx context.Context, filter bson.M, limit int) (int, error) {
+	coll := s.db.Collection(collectionTasks)
+	if limit <= 0 {
+		res, err := coll.DeleteMany(ctx, filter)
+		if err != nil {
+			return 0, err
+		}
+		return int(res.DeletedCount), nil
 	}
 
+	cursor, err := coll.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "task_pass", Value: 1}, {Key: "task_id", Value: 1}}).
+		SetLimit(int64(limit)).
+		SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return 0, err
+	}
+	var ids []any
+	for cursor.Next(ctx) {
+		var doc struct {
+			ID string `bson:"_id"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			_ = cursor.Close(ctx)
+			return 0, err
+		}
+		ids = append(ids, doc.ID)
+	}
+	err = cursor.Err()
+	_ = cursor.Close(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	res, err := coll.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err != nil {
+		return 0, err
+	}
 	return int(res.DeletedCount), nil
+}
+
+// taskStoreTxError keeps the errors a task store transaction raises on
+// purpose (condition failures, service errors) and reports anything else from
+// the driver as Unavailable.
+func taskStoreTxError(operation string, err error) error {
+	var conditionFailed *persistence.ConditionFailedError
+	if errors.As(err, &conditionFailed) {
+		return err
+	}
+	if isServiceError(err) {
+		return err
+	}
+	return serviceerror.NewUnavailablef("%s failed: %v", operation, err)
 }
 
 // -------- Task queue user data --------
@@ -728,13 +789,7 @@ func (s *taskStore) UpdateTaskQueueUserData(
 		return serviceerror.NewUnavailable("mongodb task queue user data updates require transactions-enabled topology")
 	}
 
-	session, err := s.mongoClient.StartSession(ctx)
-	if err != nil {
-		return serviceerror.NewUnavailablef("UpdateTaskQueueUserData failed to start session: %v", err)
-	}
-	defer session.EndSession(ctx)
-
-	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (interface{}, error) {
+	_, err := s.executeTransaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		for queue, update := range request.Updates {
 			if update == nil {
 				continue
@@ -752,7 +807,7 @@ func (s *taskStore) UpdateTaskQueueUserData(
 		return nil, nil
 	})
 	if err != nil {
-		return err
+		return taskStoreTxError("UpdateTaskQueueUserData", err)
 	}
 
 	for _, update := range request.Updates {
@@ -780,18 +835,16 @@ func (s *taskStore) applyUserDataUpdate(ctx context.Context, namespaceID, taskQu
 			Encoding:  update.UserData.EncodingType.String(),
 			UpdatedAt: time.Now().UTC(),
 		}
+		// The update runs in a transaction: a failure later on rolls this
+		// insert back, so no cleanup is needed here.
 		_, err := s.db.Collection(collectionTaskQueueUserData).InsertOne(ctx, doc)
 		if err != nil {
 			if mongo.IsDuplicateKeyError(err) {
 				return errUserDataVersionConflict
 			}
-			return serviceerror.NewUnavailablef("UpdateTaskQueueUserData insert failed: %v", err)
-		}
-		if err := s.applyBuildIDUpdates(ctx, namespaceID, taskQueue, update); err != nil {
-			_, _ = s.db.Collection(collectionTaskQueueUserData).DeleteOne(ctx, bson.M{"_id": doc.ID})
 			return err
 		}
-		return nil
+		return s.applyBuildIDUpdates(ctx, namespaceID, taskQueue, update)
 	}
 
 	set := bson.M{
@@ -802,7 +855,7 @@ func (s *taskStore) applyUserDataUpdate(ctx context.Context, namespaceID, taskQu
 	}
 	updateRes, err := s.db.Collection(collectionTaskQueueUserData).UpdateOne(ctx, bson.M{"_id": filter["_id"], "version": update.Version}, bson.M{"$set": set})
 	if err != nil {
-		return serviceerror.NewUnavailablef("UpdateTaskQueueUserData failed: %v", err)
+		return err
 	}
 	if updateRes.MatchedCount == 0 {
 		return errUserDataVersionConflict
@@ -816,8 +869,10 @@ func (s *taskStore) applyBuildIDUpdates(ctx context.Context, namespaceID, taskQu
 	}
 
 	coll := s.db.Collection(collectionTaskQueueBuildIDMaps)
-	var inserted []string
 
+	// This runs inside the user data transaction. A duplicate key error would
+	// abort it, so adding an existing mapping is an upsert that inserts only
+	// when the document is missing. A failure rolls the whole update back.
 	for _, buildID := range update.BuildIdsAdded {
 		doc := taskQueueBuildIDDocument{
 			ID:          taskQueueBuildIDDocID(namespaceID, buildID, taskQueue),
@@ -825,26 +880,18 @@ func (s *taskStore) applyBuildIDUpdates(ctx context.Context, namespaceID, taskQu
 			BuildID:     buildID,
 			TaskQueue:   taskQueue,
 		}
-		_, err := coll.InsertOne(ctx, doc)
-		if err != nil {
-			if mongo.IsDuplicateKeyError(err) {
-				continue
-			}
-			for _, id := range inserted {
-				_, _ = coll.DeleteOne(ctx, bson.M{"_id": id})
-			}
-			return serviceerror.NewUnavailablef("UpdateTaskQueueUserData build id insert failed: %v", err)
+		if _, err := coll.UpdateOne(ctx,
+			bson.M{"_id": doc.ID},
+			bson.M{"$setOnInsert": doc},
+			options.Update().SetUpsert(true),
+		); err != nil {
+			return err
 		}
-		inserted = append(inserted, doc.ID)
 	}
 
 	for _, buildID := range update.BuildIdsRemoved {
-		_, err := coll.DeleteOne(ctx, bson.M{"_id": taskQueueBuildIDDocID(namespaceID, buildID, taskQueue)})
-		if err != nil {
-			for _, id := range inserted {
-				_, _ = coll.DeleteOne(ctx, bson.M{"_id": id})
-			}
-			return serviceerror.NewUnavailablef("UpdateTaskQueueUserData build id delete failed: %v", err)
+		if _, err := coll.DeleteOne(ctx, bson.M{"_id": taskQueueBuildIDDocID(namespaceID, buildID, taskQueue)}); err != nil {
+			return err
 		}
 	}
 
@@ -971,11 +1018,16 @@ func (s *taskStore) CountTaskQueuesByBuildId(
 // independent lease management (rangeID) to avoid race conditions where they steal leases from
 // each other. In Cassandra, this is achieved by using separate tables (tasks vs tasks_v2).
 func taskQueueDocID(namespaceID, taskQueue string, taskType enumspb.TaskQueueType, subqueue int, fairnessEnabled bool) string {
-	version := "v1"
+	return fmt.Sprintf("%s|%s|%d|%d%s", namespaceID, taskQueue, taskType, subqueue, taskQueueVersionSuffix(fairnessEnabled))
+}
+
+// taskQueueVersionSuffix ends the _id of a classic ("|v1") or fair ("|v2")
+// task queue document.
+func taskQueueVersionSuffix(fairnessEnabled bool) string {
 	if fairnessEnabled {
-		version = "v2"
+		return "|v2"
 	}
-	return fmt.Sprintf("%s|%s|%d|%d|%s", namespaceID, taskQueue, taskType, subqueue, version)
+	return "|v1"
 }
 
 func taskDocumentID(namespaceID, taskQueue string, taskType enumspb.TaskQueueType, subqueue int, taskPass int64, taskID int64) string {

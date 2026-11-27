@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb"
+	"go.temporal.io/server/common/primitives"
 )
 
 type TaskStoreSuite struct {
@@ -532,4 +533,139 @@ func (s *TaskStoreSuite) TestFairTaskQueues() {
 	})
 	s.Require().NoError(err)
 	s.Require().Positive(count)
+}
+
+// A classic and a fair store share the task_queues collection; each lists only
+// its own queues.
+func (s *TaskStoreSuite) TestListTaskQueueSeparatesClassicAndFair() {
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+
+	classicData := []byte("classic-" + primitives.NewUUID().String())
+	fairData := []byte("fair-" + primitives.NewUUID().String())
+	for _, tc := range []struct {
+		store persistence.TaskStore
+		data  []byte
+	}{{s.store, classicData}, {fairStore, fairData}} {
+		err := tc.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+			NamespaceID:   "ns-list-sep",
+			TaskQueue:     "queue-list-sep",
+			TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			RangeID:       1,
+			TaskQueueInfo: persistence.NewDataBlob(tc.data, enumspb.ENCODING_TYPE_PROTO3.String()),
+		})
+		s.Require().NoError(err)
+	}
+
+	listAll := func(store persistence.TaskStore) [][]byte {
+		var all [][]byte
+		var token []byte
+		for {
+			resp, err := store.ListTaskQueue(s.ctx, &persistence.ListTaskQueueRequest{PageSize: 2, PageToken: token})
+			s.Require().NoError(err)
+			for _, item := range resp.Items {
+				all = append(all, item.TaskQueue.Data)
+			}
+			if len(resp.NextPageToken) == 0 {
+				return all
+			}
+			token = resp.NextPageToken
+		}
+	}
+
+	classic := listAll(s.store)
+	s.Require().Contains(classic, classicData)
+	s.Require().NotContains(classic, fairData)
+
+	fair := listAll(fairStore)
+	s.Require().Contains(fair, fairData)
+	s.Require().NotContains(fair, classicData)
+}
+
+// CompleteTasksLessThan deletes at most Limit tasks, lowest IDs first.
+func (s *TaskStoreSuite) TestCompleteTasksLessThanHonoursLimit() {
+	const (
+		ns    = "ns-complete-limit"
+		queue = "queue-complete-limit"
+	)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+		NamespaceID:   ns,
+		TaskQueue:     queue,
+		TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		RangeID:       1,
+		TaskQueueInfo: info,
+	}))
+
+	var tasks []*persistence.InternalCreateTask
+	for id := int64(1); id <= 5; id++ {
+		tasks = append(tasks, &persistence.InternalCreateTask{
+			TaskId:   id,
+			Task:     persistence.NewDataBlob([]byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()),
+			Subqueue: persistence.SubqueueZero,
+		})
+	}
+	_, err := s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID:   ns,
+		TaskQueue:     queue,
+		TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		RangeID:       1,
+		TaskQueueInfo: info,
+		Tasks:         tasks,
+	})
+	s.Require().NoError(err)
+
+	count, err := s.store.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID:        ns,
+		TaskQueueName:      queue,
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: 100,
+		Subqueue:           persistence.SubqueueZero,
+		Limit:              2,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(2, count)
+
+	resp, err := s.store.GetTasks(s.ctx, &persistence.GetTasksRequest{
+		NamespaceID:        ns,
+		TaskQueue:          queue,
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: 100,
+		Subqueue:           persistence.SubqueueZero,
+		PageSize:           10,
+		UseLimit:           true,
+	})
+	s.Require().NoError(err)
+	s.Require().Len(resp.Tasks, 3)
+}
+
+// Adding a build ID that is already mapped must not abort the user data
+// transaction.
+func (s *TaskStoreSuite) TestBuildIDAddedAgain() {
+	const (
+		ns      = "ns-build-again"
+		queue   = "queue-build-again"
+		buildID = "build-again"
+	)
+	data := persistence.NewDataBlob([]byte("data"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.UpdateTaskQueueUserData(s.ctx, &persistence.InternalUpdateTaskQueueUserDataRequest{
+		NamespaceID: ns,
+		Updates: map[string]*persistence.InternalSingleTaskQueueUserDataUpdate{
+			queue: {Version: 0, UserData: data, BuildIdsAdded: []string{buildID}},
+		},
+	}))
+	s.Require().NoError(s.store.UpdateTaskQueueUserData(s.ctx, &persistence.InternalUpdateTaskQueueUserDataRequest{
+		NamespaceID: ns,
+		Updates: map[string]*persistence.InternalSingleTaskQueueUserDataUpdate{
+			queue: {Version: 1, UserData: data, BuildIdsAdded: []string{buildID}},
+		},
+	}))
+
+	resp, err := s.store.GetTaskQueueUserData(s.ctx, &persistence.GetTaskQueueUserDataRequest{NamespaceID: ns, TaskQueue: queue})
+	s.Require().NoError(err)
+	s.Require().Equal(int64(2), resp.Version)
+
+	count, err := s.store.CountTaskQueuesByBuildId(s.ctx, &persistence.CountTaskQueuesByBuildIdRequest{NamespaceID: ns, BuildID: buildID})
+	s.Require().NoError(err)
+	s.Require().Equal(1, count)
 }
