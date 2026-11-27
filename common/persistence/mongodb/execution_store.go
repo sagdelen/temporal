@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -781,6 +782,14 @@ func decodeHistoryNodePageToken(data []byte) (historyNodePageToken, error) {
 	return token, nil
 }
 
+// historyNodeFilter builds the filter of ReadHistoryBranch.
+//
+// The node range is expressed twice, on _id and on node_id. The _id of a
+// history node is "tree|branch|node|txn" with sortable numbers, so a range of
+// node IDs is a range of _id values and is served by the _id index. The same
+// range on node_id lets the {shard_id, tree_id, branch_id, node_id, txn_id}
+// index bound its scan. With both in the filter the read is bounded whichever
+// index the planner picks, including while that index does not exist yet.
 func historyNodeFilter(
 	shardID int32,
 	treeID, branchID string,
@@ -793,53 +802,62 @@ func historyNodeFilter(
 		"branch_id": branchID,
 	}
 
-	if req.ReverseOrder {
-		idCond := bson.M{}
-		if token.LastNodeID != 0 {
+	nodeCond := bson.M{}
+	idCond := bson.M{}
+	if req.MinNodeID != 0 {
+		nodeCond["$gte"] = req.MinNodeID
+		idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, math.MinInt64)
+	}
+	if req.MaxNodeID != 0 {
+		nodeCond["$lt"] = req.MaxNodeID
+		idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, math.MinInt64)
+	}
+
+	if token.LastNodeID != 0 {
+		if req.ReverseOrder {
+			// Reverse order is node ID descending, then transaction ID
+			// descending, which is _id descending: continue below the last
+			// document returned.
+			delete(nodeCond, "$lt")
+			nodeCond["$lte"] = token.LastNodeID
 			idCond["$lt"] = historyNodeDocID(treeID, branchID, token.LastNodeID, token.LastTxnID)
-		} else if req.MaxNodeID != 0 {
-			idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-		}
-		if req.MinNodeID != 0 {
-			idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-		}
-		if len(idCond) > 0 {
-			filter["_id"] = idCond
-		}
-	} else {
-		// Forward order: NodeID ASC, TxnID DESC
-		// SQL uses: ((node_id = ? AND txn_id > ?) OR node_id > ?) AND node_id < ?
-		// Since MongoDB stores TxnID normally (not negated like SQL), we use TxnID < for same NodeID.
-		if token.LastNodeID != 0 {
-			// Pagination with token: get records after the last one
-			// Use $and to combine $or pagination with MaxNodeID constraint
-			orCond := []bson.M{
+		} else {
+			// Forward order is node ID ascending, then transaction ID
+			// descending (SQL stores the negated transaction ID for this):
+			// continue with lower transaction IDs of the last node, then with
+			// higher nodes.
+			nodeCond["$gte"] = token.LastNodeID
+			idCond["$gte"] = historyNodeDocID(treeID, branchID, token.LastNodeID, math.MinInt64)
+			filter["$or"] = []bson.M{
 				{"node_id": bson.M{"$gt": token.LastNodeID}},
 				{"node_id": token.LastNodeID, "txn_id": bson.M{"$lt": token.LastTxnID}},
 			}
-			if req.MaxNodeID != 0 {
-				filter["$and"] = []bson.M{
-					{"$or": orCond},
-					{"node_id": bson.M{"$lt": req.MaxNodeID}},
-				}
-			} else {
-				filter["$or"] = orCond
-			}
-		} else {
-			// No token: use _id range query
-			idCond := bson.M{}
-			if req.MinNodeID != 0 {
-				idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-			}
-			if req.MaxNodeID != 0 {
-				idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-			}
-			if len(idCond) > 0 {
-				filter["_id"] = idCond
-			}
 		}
 	}
+
+	if len(nodeCond) > 0 {
+		filter["node_id"] = nodeCond
+	}
+	if len(idCond) > 0 {
+		filter["_id"] = idCond
+	}
 	return filter
+}
+
+// historyNodeSort returns the sort of ReadHistoryBranch.
+func historyNodeSort(reverseOrder bool) bson.D {
+	if reverseOrder {
+		// Node ID descending, then transaction ID descending. That is the
+		// descending order of _id, which the _id index provides.
+		return bson.D{{Key: "_id", Value: -1}}
+	}
+	// Node ID ascending, then transaction ID descending (to satisfy
+	// history_manager.filterHistoryNodes). Provided by the
+	// {shard_id, tree_id, branch_id, node_id, txn_id: -1} index.
+	return bson.D{
+		{Key: "node_id", Value: 1},
+		{Key: "txn_id", Value: -1},
+	}
 }
 
 type historyBranchListPageToken struct {
@@ -2762,23 +2780,8 @@ func (s *executionStore) ReadHistoryBranch(
 
 	filter := historyNodeFilter(request.ShardID, treeID, branchID, request, token)
 
-	var sortSpec bson.D
-	if request.ReverseOrder {
-		// Reverse: NodeID DESC, TxnID DESC
-		sortSpec = bson.D{
-			{Key: "node_id", Value: -1},
-			{Key: "txn_id", Value: -1},
-		}
-	} else {
-		// Forward: NodeID ASC, TxnID DESC (to satisfy history_manager.filterHistoryNodes)
-		sortSpec = bson.D{
-			{Key: "node_id", Value: 1},
-			{Key: "txn_id", Value: -1},
-		}
-	}
-
 	findOpts := options.Find().
-		SetSort(sortSpec).
+		SetSort(historyNodeSort(request.ReverseOrder)).
 		SetLimit(int64(limit))
 
 	cursor, err := s.historyNodesCol.Find(ctx, filter, findOpts)

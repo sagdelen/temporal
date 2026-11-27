@@ -60,6 +60,17 @@ func setUpMongoDBTest(t *testing.T) (MongoDBTestData, func()) {
 	}
 	testData.Factory = factory
 
+	// Build the indexes of the background index migrations before the tests
+	// use the database. An index build takes a short exclusive collection
+	// lock, and a transaction that runs into it fails with LockTimeout.
+	migrationCtx, migrationCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer migrationCancel()
+	if err := factory.RunIndexMigrations(migrationCtx); err != nil {
+		factory.Close()
+		mh.StopCapture(testData.Metrics)
+		t.Fatalf("unable to run MongoDB index migrations: %v", err)
+	}
+
 	tearDown := func() {
 		testData.Factory.Close()
 		mh.StopCapture(testData.Metrics)
