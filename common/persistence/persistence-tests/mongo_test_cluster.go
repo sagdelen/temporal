@@ -11,10 +11,12 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.temporal.io/server/common/config"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/mongodb"
+	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/temporal/environment"
 )
 
@@ -74,6 +76,7 @@ func (c *MongoTestCluster) Config() config.Persistence {
 				FaultInjection: c.faultInjection,
 			},
 		},
+		TransactionSizeLimit: dynamicconfig.GetIntPropertyFn(primitives.DefaultTransactionSizeLimit),
 	}
 }
 
