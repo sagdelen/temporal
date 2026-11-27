@@ -34,6 +34,9 @@ import (
 // mongoClient implements the Client interface
 type mongoClient struct {
 	client *mongo.Client
+	// sessionOpts holds the defaults (read preference, write concern) that
+	// every session, and so every transaction, starts with.
+	sessionOpts *options.SessionOptions
 }
 
 // NewClient creates a new MongoDB client and establishes connection
@@ -49,12 +52,19 @@ func NewClient(ctx context.Context, uri string, opts ...*options.ClientOptions) 
 		}
 	}
 
+	return NewClientFromOptions(ctx, clientOpts, nil)
+}
+
+// NewClientFromOptions creates a MongoDB client from fully built client
+// options. sessionOpts, when set, are applied to every session the client
+// starts.
+func NewClientFromOptions(ctx context.Context, clientOpts *options.ClientOptions, sessionOpts *options.SessionOptions) (Client, error) {
 	client, err := mongo.Connect(ctx, clientOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
 	}
 
-	return &mongoClient{client: client}, nil
+	return &mongoClient{client: client, sessionOpts: sessionOpts}, nil
 }
 
 func (c *mongoClient) Connect(ctx context.Context) error {
@@ -74,7 +84,11 @@ func (c *mongoClient) Database(name string) Database {
 }
 
 func (c *mongoClient) StartSession(ctx context.Context) (Session, error) {
-	session, err := c.client.StartSession()
+	var sessionOpts []*options.SessionOptions
+	if c.sessionOpts != nil {
+		sessionOpts = append(sessionOpts, c.sessionOpts)
+	}
+	session, err := c.client.StartSession(sessionOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}

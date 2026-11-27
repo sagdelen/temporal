@@ -3,6 +3,7 @@ package mongodb_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +111,81 @@ func (s *MetadataStoreSuite) TestCreateNamespaceDuplicateName() {
 	s.Require().Error(err)
 	_, ok := err.(*serviceerror.NamespaceAlreadyExists)
 	s.Require().True(ok)
+}
+
+// Concurrent creates must all succeed, as in SQL where they serialize on the
+// metadata row, and every namespace must carry a distinct version below the
+// final metadata version.
+func (s *MetadataStoreSuite) TestCreateNamespaceConcurrent() {
+	const n = 30
+	before, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+
+	ids := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		ids[i] = primitives.NewUUID().String()
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = s.store.CreateNamespace(s.ctx, &persistence.InternalCreateNamespaceRequest{
+				ID:        ids[i],
+				Name:      fmt.Sprintf("test-namespace-concurrent-%d-%s", i, ids[i]),
+				Namespace: &commonpb.DataBlob{Data: []byte("namespace-data"), EncodingType: 1},
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		s.Require().NoErrorf(err, "create %d", i)
+	}
+
+	after, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+	s.Require().Equal(before.NotificationVersion+n, after.NotificationVersion)
+
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		resp, err := s.store.GetNamespace(s.ctx, &persistence.GetNamespaceRequest{ID: id})
+		s.Require().NoError(err)
+		s.Require().GreaterOrEqual(resp.NotificationVersion, before.NotificationVersion)
+		s.Require().Less(resp.NotificationVersion, after.NotificationVersion)
+		s.Require().False(seen[resp.NotificationVersion], "version %d used twice", resp.NotificationVersion)
+		seen[resp.NotificationVersion] = true
+	}
+}
+
+// A create that fails on a duplicate name rolls back with its metadata bump:
+// the version stays put and the second ID is not stored.
+func (s *MetadataStoreSuite) TestCreateNamespaceDuplicateNameIsAtomic() {
+	name := "test-namespace-dup-" + primitives.NewUUID().String()
+	_, err := s.store.CreateNamespace(s.ctx, &persistence.InternalCreateNamespaceRequest{
+		ID:        primitives.NewUUID().String(),
+		Name:      name,
+		Namespace: &commonpb.DataBlob{Data: []byte("namespace-data"), EncodingType: 1},
+	})
+	s.Require().NoError(err)
+
+	before, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+
+	secondID := primitives.NewUUID().String()
+	_, err = s.store.CreateNamespace(s.ctx, &persistence.InternalCreateNamespaceRequest{
+		ID:        secondID,
+		Name:      name,
+		Namespace: &commonpb.DataBlob{Data: []byte("namespace-data"), EncodingType: 1},
+	})
+	var alreadyExists *serviceerror.NamespaceAlreadyExists
+	s.Require().ErrorAs(err, &alreadyExists)
+
+	after, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+	s.Require().Equal(before.NotificationVersion, after.NotificationVersion)
+
+	_, err = s.store.GetNamespace(s.ctx, &persistence.GetNamespaceRequest{ID: secondID})
+	var notFound *serviceerror.NamespaceNotFound
+	s.Require().ErrorAs(err, &notFound)
 }
 
 func (s *MetadataStoreSuite) TestUpdateNamespace() {

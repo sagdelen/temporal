@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	commonpb "go.temporal.io/api/common/v1"
@@ -86,13 +88,6 @@ type (
 		CassandraBlob *dataBlobDoc `bson:"cassandra_blob,omitempty"`
 	}
 
-	historyTaskDoc struct {
-		CategoryID int          `bson:"category_id"`
-		FireTime   time.Time    `bson:"fire_time"`
-		TaskID     int64        `bson:"task_id"`
-		Blob       *dataBlobDoc `bson:"blob,omitempty"`
-	}
-
 	historyBranchDocument struct {
 		ID       string       `bson:"_id"`
 		ShardID  int32        `bson:"shard_id"`
@@ -140,36 +135,35 @@ type (
 	}
 
 	executionDocument struct {
-		ID                   string           `bson:"_id"`
-		ShardID              int32            `bson:"shard_id"`
-		NamespaceID          string           `bson:"namespace_id"`
-		WorkflowID           string           `bson:"workflow_id"`
-		RunID                string           `bson:"run_id"`
-		NextEventID          int64            `bson:"next_event_id"`
-		DBRecordVersion      int64            `bson:"db_record_version"`
-		LastWriteVersion     int64            `bson:"last_write_version"`
-		StartVersion         int64            `bson:"start_version"`
-		State                int32            `bson:"state"`
-		Status               int32            `bson:"status"`
-		Condition            int64            `bson:"condition"`
-		StateTransitionCount int64            `bson:"state_transition_count,omitempty"`
-		CreateRequestID      string           `bson:"create_request_id,omitempty"`
-		UpdateTime           time.Time        `bson:"update_time"`
-		StartTime            *time.Time       `bson:"start_time,omitempty"`
-		ExecutionTime        *time.Time       `bson:"execution_time,omitempty"`
-		VisibilityTime       *time.Time       `bson:"visibility_time,omitempty"`
-		ExecutionInfo        *dataBlobDoc     `bson:"execution_info"`
-		ExecutionState       *dataBlobDoc     `bson:"execution_state"`
-		ActivityInfos        []int64BlobDoc   `bson:"activity_infos,omitempty"`
-		TimerInfos           []stringBlobDoc  `bson:"timer_infos,omitempty"`
-		ChildExecutionInfos  []int64BlobDoc   `bson:"child_execution_infos,omitempty"`
-		RequestCancelInfos   []int64BlobDoc   `bson:"request_cancel_infos,omitempty"`
-		SignalInfos          []int64BlobDoc   `bson:"signal_infos,omitempty"`
-		SignalRequestedIDs   []string         `bson:"signal_requested_ids,omitempty"`
-		ChasmNodes           []chasmNodeDoc   `bson:"chasm_nodes,omitempty"`
-		BufferedEvents       *dataBlobDoc     `bson:"buffered_events,omitempty"`
-		Tasks                []historyTaskDoc `bson:"tasks,omitempty"`
-		Checksum             *dataBlobDoc     `bson:"checksum,omitempty"`
+		ID                   string          `bson:"_id"`
+		ShardID              int32           `bson:"shard_id"`
+		NamespaceID          string          `bson:"namespace_id"`
+		WorkflowID           string          `bson:"workflow_id"`
+		RunID                string          `bson:"run_id"`
+		NextEventID          int64           `bson:"next_event_id"`
+		DBRecordVersion      int64           `bson:"db_record_version"`
+		LastWriteVersion     int64           `bson:"last_write_version"`
+		StartVersion         int64           `bson:"start_version"`
+		State                int32           `bson:"state"`
+		Status               int32           `bson:"status"`
+		Condition            int64           `bson:"condition"`
+		StateTransitionCount int64           `bson:"state_transition_count,omitempty"`
+		CreateRequestID      string          `bson:"create_request_id,omitempty"`
+		UpdateTime           time.Time       `bson:"update_time"`
+		StartTime            *time.Time      `bson:"start_time,omitempty"`
+		ExecutionTime        *time.Time      `bson:"execution_time,omitempty"`
+		VisibilityTime       *time.Time      `bson:"visibility_time,omitempty"`
+		ExecutionInfo        *dataBlobDoc    `bson:"execution_info"`
+		ExecutionState       *dataBlobDoc    `bson:"execution_state"`
+		ActivityInfos        []int64BlobDoc  `bson:"activity_infos,omitempty"`
+		TimerInfos           []stringBlobDoc `bson:"timer_infos,omitempty"`
+		ChildExecutionInfos  []int64BlobDoc  `bson:"child_execution_infos,omitempty"`
+		RequestCancelInfos   []int64BlobDoc  `bson:"request_cancel_infos,omitempty"`
+		SignalInfos          []int64BlobDoc  `bson:"signal_infos,omitempty"`
+		SignalRequestedIDs   []string        `bson:"signal_requested_ids,omitempty"`
+		ChasmNodes           []chasmNodeDoc  `bson:"chasm_nodes,omitempty"`
+		BufferedEvents       bufferedBatches `bson:"buffered_events,omitempty"`
+		Checksum             *dataBlobDoc    `bson:"checksum,omitempty"`
 	}
 
 	currentExecutionDocument struct {
@@ -275,6 +269,78 @@ func timePtrFromProto(ts *timestamppb.Timestamp) *time.Time {
 	return &t
 }
 
+// bufferedBatches holds the buffered event batches of an execution in the
+// order they were buffered.
+//
+// The store keeps the whole buffer as one blob sub-document, which is the
+// shape it has always written: a new batch is merged into the stored one (see
+// appendBufferedBatch), so servers that have not been upgraded, or that were
+// rolled back, can read every document. An empty buffer is stored as null.
+//
+// Batches that cannot be merged are stored as an array of blobs. That cannot
+// happen with the encodings Temporal writes today; the form exists so that
+// such a batch is kept instead of dropped.
+type bufferedBatches []dataBlobDoc
+
+// MarshalBSONValue implements bson.ValueMarshaler.
+func (b bufferedBatches) MarshalBSONValue() (bsontype.Type, []byte, error) {
+	switch len(b) {
+	case 0:
+		return bsontype.Null, nil, nil
+	case 1:
+		return bson.MarshalValue(b[0])
+	default:
+		return bson.MarshalValue([]dataBlobDoc(b))
+	}
+}
+
+// UnmarshalBSONValue implements bson.ValueUnmarshaler.
+func (b *bufferedBatches) UnmarshalBSONValue(t bsontype.Type, data []byte) error {
+	switch t {
+	case bsontype.Null, bsontype.Undefined:
+		*b = nil
+		return nil
+	case bsontype.EmbeddedDocument:
+		var single dataBlobDoc
+		if err := bson.UnmarshalValue(t, data, &single); err != nil {
+			return err
+		}
+		*b = bufferedBatches{single}
+		return nil
+	case bsontype.Array:
+		var batches []dataBlobDoc
+		if err := bson.UnmarshalValue(t, data, &batches); err != nil {
+			return err
+		}
+		*b = batches
+		return nil
+	default:
+		return fmt.Errorf("unexpected BSON type %v for buffered_events", t)
+	}
+}
+
+// appendBufferedBatch adds a newly buffered batch to the buffer.
+//
+// A batch is a serialized historypb.History message. Protobuf defines the
+// concatenation of two serialized messages as their merge, and merging appends
+// repeated fields, so the bytes of two proto3 batches joined together decode
+// as one batch holding the events of both in order. The buffer therefore stays
+// a single blob. A batch in any other encoding is kept as a separate entry.
+func appendBufferedBatch(batches bufferedBatches, batch dataBlobDoc) bufferedBatches {
+	proto3 := enumspb.ENCODING_TYPE_PROTO3.String()
+	// A blob without an encoding is read as proto3 (see dataBlobDocToBlob).
+	isProto3 := func(encoding string) bool { return encoding == "" || encoding == proto3 }
+	if n := len(batches); n > 0 && isProto3(batches[n-1].Encoding) && isProto3(batch.Encoding) {
+		last := batches[n-1]
+		merged := make([]byte, 0, len(last.Data)+len(batch.Data))
+		merged = append(merged, last.Data...)
+		merged = append(merged, batch.Data...)
+		batches[n-1] = dataBlobDoc{Data: merged, Encoding: proto3}
+		return batches
+	}
+	return append(batches, batch)
+}
+
 func dataBlobToDoc(blob *commonpb.DataBlob) *dataBlobDoc {
 	if blob == nil {
 		return nil
@@ -353,34 +419,6 @@ func mapSignalRequestedIDs(ids map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func mapHistoryTasks(tasksByCategory map[taskspkg.Category][]persistence.InternalHistoryTask) []historyTaskDoc {
-	if len(tasksByCategory) == 0 {
-		return nil
-	}
-	docs := make([]historyTaskDoc, 0)
-	for category, taskList := range tasksByCategory {
-		categoryID := category.ID()
-		for _, task := range taskList {
-			docs = append(docs, historyTaskDoc{
-				CategoryID: categoryID,
-				FireTime:   task.Key.FireTime.UTC(),
-				TaskID:     task.Key.TaskID,
-				Blob:       dataBlobToDoc(task.Blob),
-			})
-		}
-	}
-	sort.Slice(docs, func(i, j int) bool {
-		if docs[i].CategoryID != docs[j].CategoryID {
-			return docs[i].CategoryID < docs[j].CategoryID
-		}
-		if docs[i].FireTime.Equal(docs[j].FireTime) {
-			return docs[i].TaskID < docs[j].TaskID
-		}
-		return docs[i].FireTime.Before(docs[j].FireTime)
-	})
-	return docs
 }
 
 func dataBlobDocToBlob(doc *dataBlobDoc) *commonpb.DataBlob {
@@ -500,16 +538,20 @@ func taskKeySpecified(key taskspkg.Key) bool {
 	return !key.FireTime.IsZero() || key.TaskID != 0
 }
 
-func (s *executionStore) insertHistoryTaskDoc(
+// tryInsertHistoryTaskDoc inserts a history task. duplicate is true when a
+// task with the same key already exists; nothing is written in that case.
+// Inside a transaction the caller must then end the transaction with an
+// error, because a duplicate key error aborts it.
+func (s *executionStore) tryInsertHistoryTaskDoc(
 	ctx context.Context,
 	col client.Collection,
 	categoryType taskspkg.CategoryType,
 	categoryID int,
 	shardID int32,
 	task persistence.InternalHistoryTask,
-) error {
+) (bool, error) {
 	if err := taskspkg.ValidateKey(task.Key); err != nil {
-		return serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
+		return false, serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
 	}
 
 	blobDoc := dataBlobToDoc(task.Blob)
@@ -525,9 +567,9 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
 		}
 	case taskspkg.CategoryTypeScheduled:
 		doc := scheduledTaskDocument{
@@ -540,16 +582,26 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
 		}
 	default:
-		return serviceerror.NewInternalf("unknown task category type: %v", categoryType)
+		return false, serviceerror.NewInternalf("unknown task category type: %v", categoryType)
 	}
-	return nil
+	return false, nil
 }
 
+// insertWorkflowTasks writes the history tasks of a workflow transaction and
+// must be called inside that transaction.
+//
+// A task key that already exists fails the transaction, as it does in the SQL
+// stores. It must not be ignored: a duplicate key error aborts a MongoDB
+// transaction, so every later operation and the commit would fail with
+// NoSuchTransaction, which the driver treats as transient and retries until
+// its time limit. Task IDs are allocated per shard owner, so a collision means
+// another owner wrote into the same range; Unavailable makes the shard renew
+// its range before the write is attempted again.
 func (s *executionStore) insertWorkflowTasks(
 	ctx context.Context,
 	shardID int32,
@@ -570,8 +622,15 @@ func (s *executionStore) insertWorkflowTasks(
 		}
 
 		for _, task := range taskList {
-			if err := s.insertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task); err != nil {
+			duplicate, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
+			if err != nil {
 				return err
+			}
+			if duplicate {
+				return serviceerror.NewUnavailablef(
+					"history task already exists. shard: %v, category: %v, task key: %v",
+					shardID, categoryID, task.Key,
+				)
 			}
 		}
 	}
@@ -781,6 +840,14 @@ func decodeHistoryNodePageToken(data []byte) (historyNodePageToken, error) {
 	return token, nil
 }
 
+// historyNodeFilter builds the filter of ReadHistoryBranch.
+//
+// The node range is expressed twice, on _id and on node_id. The _id of a
+// history node is "tree|branch|node|txn" with sortable numbers, so a range of
+// node IDs is a range of _id values and is served by the _id index. The same
+// range on node_id lets the {shard_id, tree_id, branch_id, node_id, txn_id}
+// index bound its scan. With both in the filter the read is bounded whichever
+// index the planner picks, including while that index does not exist yet.
 func historyNodeFilter(
 	shardID int32,
 	treeID, branchID string,
@@ -793,53 +860,62 @@ func historyNodeFilter(
 		"branch_id": branchID,
 	}
 
-	if req.ReverseOrder {
-		idCond := bson.M{}
-		if token.LastNodeID != 0 {
+	nodeCond := bson.M{}
+	idCond := bson.M{}
+	if req.MinNodeID != 0 {
+		nodeCond["$gte"] = req.MinNodeID
+		idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, math.MinInt64)
+	}
+	if req.MaxNodeID != 0 {
+		nodeCond["$lt"] = req.MaxNodeID
+		idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, math.MinInt64)
+	}
+
+	if token.LastNodeID != 0 {
+		if req.ReverseOrder {
+			// Reverse order is node ID descending, then transaction ID
+			// descending, which is _id descending: continue below the last
+			// document returned.
+			delete(nodeCond, "$lt")
+			nodeCond["$lte"] = token.LastNodeID
 			idCond["$lt"] = historyNodeDocID(treeID, branchID, token.LastNodeID, token.LastTxnID)
-		} else if req.MaxNodeID != 0 {
-			idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-		}
-		if req.MinNodeID != 0 {
-			idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-		}
-		if len(idCond) > 0 {
-			filter["_id"] = idCond
-		}
-	} else {
-		// Forward order: NodeID ASC, TxnID DESC
-		// SQL uses: ((node_id = ? AND txn_id > ?) OR node_id > ?) AND node_id < ?
-		// Since MongoDB stores TxnID normally (not negated like SQL), we use TxnID < for same NodeID.
-		if token.LastNodeID != 0 {
-			// Pagination with token: get records after the last one
-			// Use $and to combine $or pagination with MaxNodeID constraint
-			orCond := []bson.M{
+		} else {
+			// Forward order is node ID ascending, then transaction ID
+			// descending (SQL stores the negated transaction ID for this):
+			// continue with lower transaction IDs of the last node, then with
+			// higher nodes.
+			nodeCond["$gte"] = token.LastNodeID
+			idCond["$gte"] = historyNodeDocID(treeID, branchID, token.LastNodeID, math.MinInt64)
+			filter["$or"] = []bson.M{
 				{"node_id": bson.M{"$gt": token.LastNodeID}},
 				{"node_id": token.LastNodeID, "txn_id": bson.M{"$lt": token.LastTxnID}},
 			}
-			if req.MaxNodeID != 0 {
-				filter["$and"] = []bson.M{
-					{"$or": orCond},
-					{"node_id": bson.M{"$lt": req.MaxNodeID}},
-				}
-			} else {
-				filter["$or"] = orCond
-			}
-		} else {
-			// No token: use _id range query
-			idCond := bson.M{}
-			if req.MinNodeID != 0 {
-				idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-			}
-			if req.MaxNodeID != 0 {
-				idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-			}
-			if len(idCond) > 0 {
-				filter["_id"] = idCond
-			}
 		}
 	}
+
+	if len(nodeCond) > 0 {
+		filter["node_id"] = nodeCond
+	}
+	if len(idCond) > 0 {
+		filter["_id"] = idCond
+	}
 	return filter
+}
+
+// historyNodeSort returns the sort of ReadHistoryBranch.
+func historyNodeSort(reverseOrder bool) bson.D {
+	if reverseOrder {
+		// Node ID descending, then transaction ID descending. That is the
+		// descending order of _id, which the _id index provides.
+		return bson.D{{Key: "_id", Value: -1}}
+	}
+	// Node ID ascending, then transaction ID descending (to satisfy
+	// history_manager.filterHistoryNodes). Provided by the
+	// {shard_id, tree_id, branch_id, node_id, txn_id: -1} index.
+	return bson.D{
+		{Key: "node_id", Value: 1},
+		{Key: "txn_id", Value: -1},
+	}
 }
 
 type historyBranchListPageToken struct {
@@ -864,6 +940,13 @@ func decodeHistoryBranchListToken(data []byte) (historyBranchListPageToken, erro
 		return historyBranchListPageToken{}, err
 	}
 	return token, nil
+}
+
+// executionDocumentUpdate wraps the $set of an execution document update.
+// Execution documents written before this release carry a "tasks" array that
+// nothing reads; every update removes it so documents shrink back over time.
+func executionDocumentUpdate(set bson.M) bson.M {
+	return bson.M{"$set": set, "$unset": bson.M{"tasks": ""}}
 }
 
 func executionDocumentUpdateSet(doc *executionDocument) bson.M {
@@ -891,7 +974,6 @@ func executionDocumentUpdateSet(doc *executionDocument) bson.M {
 		"signal_requested_ids":   doc.SignalRequestedIDs,
 		"chasm_nodes":            doc.ChasmNodes,
 		"buffered_events":        doc.BufferedEvents,
-		"tasks":                  doc.Tasks,
 		"checksum":               doc.Checksum,
 		"state_transition_count": doc.StateTransitionCount,
 	}
@@ -1052,15 +1134,15 @@ func (s *executionStore) applyMutationToExecutionDocument(
 	doc.ChasmNodes = mapChasmNodes(chasmNodes)
 
 	// Buffered events.
+	// Buffered events are append-only between flushes: a mutation carries only
+	// its own new batch and the events buffered by earlier transactions must be
+	// kept. Clearing first and appending afterwards matches the SQL stores, which
+	// delete the buffered rows and then insert the new batch.
 	if mutation.ClearBufferedEvents {
 		doc.BufferedEvents = nil
-	} else if mutation.NewBufferedEvents != nil {
-		doc.BufferedEvents = dataBlobToDoc(mutation.NewBufferedEvents)
 	}
-
-	// Tasks (best effort only tracked for observability in this stub).
-	if len(mutation.Tasks) > 0 {
-		doc.Tasks = mapHistoryTasks(mutation.Tasks)
+	if newBatch := dataBlobToDoc(mutation.NewBufferedEvents); newBatch != nil {
+		doc.BufferedEvents = appendBufferedBatch(doc.BufferedEvents, *newBatch)
 	}
 
 	doc.Checksum = dataBlobToDoc(mutation.Checksum)
@@ -1232,8 +1314,11 @@ func (s *executionStore) applyWorkflowMutation(
 		"db_record_version": oldVersion,
 	}
 	updateSet := executionDocumentUpdateSet(doc)
-	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
+	result, err := s.executionsCol.UpdateOne(ctx, filter, executionDocumentUpdate(updateSet))
 	if err != nil {
+		if isSizeLimitError(err) {
+			return nil, newSizeLimitError(err)
+		}
 		return nil, serviceerror.NewUnavailablef("failed to update execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
@@ -1397,7 +1482,6 @@ func (s *executionStore) buildExecutionDocument(request *persistence.InternalCre
 		SignalInfos:         mapInt64Blobs(snapshot.SignalInfos),
 		SignalRequestedIDs:  mapSignalRequestedIDs(snapshot.SignalRequestedIDs),
 		ChasmNodes:          mapChasmNodes(snapshot.ChasmNodes),
-		Tasks:               mapHistoryTasks(snapshot.Tasks),
 		Checksum:            dataBlobToDoc(snapshot.Checksum),
 	}
 
@@ -1620,6 +1704,9 @@ func (s *executionStore) insertExecutionDocument(ctx context.Context, doc *execu
 		if mongo.IsDuplicateKeyError(err) {
 			return &persistence.WorkflowConditionFailedError{Msg: "workflow execution already exists"}
 		}
+		if isSizeLimitError(err) {
+			return newSizeLimitError(err)
+		}
 		return serviceerror.NewUnavailablef("failed to insert execution document: %v", err)
 	}
 	return nil
@@ -1715,7 +1802,8 @@ func (s *executionStore) CreateWorkflowExecution(
 	}
 
 	fn := func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1746,6 +1834,10 @@ func (s *executionStore) CreateWorkflowExecution(
 			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
 				return nil, err
 			}
+		}
+
+		if err := s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
+			return nil, err
 		}
 
 		return &persistence.InternalCreateWorkflowExecutionResponse{}, nil
@@ -1779,7 +1871,8 @@ func (s *executionStore) UpdateWorkflowExecution(
 	}
 
 	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1793,7 +1886,11 @@ func (s *executionStore) UpdateWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, s.applyUpdateWorkflowExecution(sessCtx, request)
+		if err := s.applyUpdateWorkflowExecution(sessCtx, request); err != nil {
+			return nil, err
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 	return err
 }
@@ -1803,10 +1900,9 @@ func (s *executionStore) executionDocumentToMutableState(doc *executionDocument)
 		return nil
 	}
 
-	bufferedEventsBlob := dataBlobDocToBlob(doc.BufferedEvents)
 	var bufferedEvents []*commonpb.DataBlob
-	if bufferedEventsBlob != nil {
-		bufferedEvents = []*commonpb.DataBlob{bufferedEventsBlob}
+	for i := range doc.BufferedEvents {
+		bufferedEvents = append(bufferedEvents, dataBlobDocToBlob(&doc.BufferedEvents[i]))
 	}
 
 	state := &persistence.InternalWorkflowMutableState{
@@ -1836,7 +1932,8 @@ func (s *executionStore) ConflictResolveWorkflowExecution(
 	}
 
 	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1851,7 +1948,11 @@ func (s *executionStore) ConflictResolveWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, s.applyConflictResolveWorkflowExecution(sessCtx, request)
+		if err := s.applyConflictResolveWorkflowExecution(sessCtx, request); err != nil {
+			return nil, err
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 	return err
 }
@@ -1917,7 +2018,7 @@ func (s *executionStore) applyConflictResolveWorkflowExecution(
 		"db_record_version": existing.DBRecordVersion,
 	}
 	updateSet := executionDocumentUpdateSet(resetDoc)
-	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
+	result, err := s.executionsCol.UpdateOne(ctx, filter, executionDocumentUpdate(updateSet))
 	if err != nil {
 		return serviceerror.NewUnavailablef("failed to reset execution document: %v", err)
 	}
@@ -2127,7 +2228,8 @@ func (s *executionStore) SetWorkflowExecution(
 	newDoc.UpdateTime = time.Now().UTC()
 
 	_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -2164,9 +2266,12 @@ func (s *executionStore) SetWorkflowExecution(
 			"_id":               newDoc.ID,
 			"db_record_version": existing.DBRecordVersion,
 		}
-		update := bson.M{"$set": executionDocumentUpdateSet(newDoc)}
+		update := executionDocumentUpdate(executionDocumentUpdateSet(newDoc))
 		result, err := s.executionsCol.UpdateOne(sessCtx, filter, update)
 		if err != nil {
+			if isSizeLimitError(err) {
+				return nil, newSizeLimitError(err)
+			}
 			return nil, serviceerror.NewUnavailablef("failed to set workflow execution: %v", err)
 		}
 		if result.MatchedCount == 0 {
@@ -2177,7 +2282,7 @@ func (s *executionStore) SetWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, nil
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 
 	return err
@@ -2264,24 +2369,92 @@ func (s *executionStore) AddHistoryTasks(
 		return nil
 	}
 
+	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+		// Fence, read half: fail fast if shard ownership is already lost.
+		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
+			return nil, err
+		}
+
+		for category, taskList := range request.Tasks {
+			if len(taskList) == 0 {
+				continue
+			}
+
+			col, categoryID, categoryType, err := s.taskCollectionForCategory(category)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, task := range taskList {
+				duplicate, err := s.tryInsertHistoryTaskDoc(sessCtx, col, categoryType, categoryID, request.ShardID, task)
+				if err != nil {
+					return nil, err
+				}
+				if duplicate {
+					// A duplicate key error aborts the MongoDB transaction, so
+					// nothing of this attempt is written. Leave the transaction
+					// and find out below whether the whole batch is there.
+					return nil, errHistoryTasksAlreadyPersisted
+				}
+			}
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
+	})
+	if errors.Is(err, errHistoryTasksAlreadyPersisted) {
+		// The batch is written atomically, so if an earlier attempt of this
+		// request committed, every task of it exists and the request is done.
+		// Anything else is a task key collision with a different write: this
+		// batch was not written, and reporting success would lose its tasks.
+		persisted, checkErr := s.historyTasksPersisted(ctx, request)
+		if checkErr != nil {
+			return checkErr
+		}
+		if persisted {
+			return nil
+		}
+		return serviceerror.NewUnavailablef(
+			"history task already exists and the batch was not written. shard: %v", request.ShardID)
+	}
+	return err
+}
+
+// historyTasksPersisted reports whether every task of the request exists.
+func (s *executionStore) historyTasksPersisted(
+	ctx context.Context,
+	request *persistence.InternalAddHistoryTasksRequest,
+) (bool, error) {
 	for category, taskList := range request.Tasks {
 		if len(taskList) == 0 {
 			continue
 		}
-
 		col, categoryID, categoryType, err := s.taskCollectionForCategory(category)
 		if err != nil {
-			return err
+			return false, err
 		}
 
+		ids := make([]string, 0, len(taskList))
+		seen := make(map[string]struct{}, len(taskList))
 		for _, task := range taskList {
-			if err := s.insertHistoryTaskDoc(ctx, col, categoryType, categoryID, request.ShardID, task); err != nil {
-				return err
+			id := immediateDocIDForKey(request.ShardID, categoryID, task.Key)
+			if categoryType == taskspkg.CategoryTypeScheduled {
+				id = scheduledDocIDForKey(request.ShardID, categoryID, task.Key)
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
 			}
 		}
-	}
 
-	return nil
+		count, err := col.CountDocuments(ctx, bson.M{"_id": bson.M{"$in": ids}})
+		if err != nil {
+			return false, serviceerror.NewUnavailablef("failed to check history tasks: %v", err)
+		}
+		if count != int64(len(ids)) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *executionStore) GetHistoryTasks(
@@ -2666,45 +2839,86 @@ func (s *executionStore) AppendHistoryNodes(
 		Events:    dataBlobToDoc(node.Events),
 	}
 
-	if _, err := s.historyNodesCol.InsertOne(ctx, nodeDoc); err != nil {
-		switch {
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-			return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
-		case mongo.IsDuplicateKeyError(err):
-			return &persistence.ConditionFailedError{Msg: "history node already exists"}
-		default:
-			return serviceerror.NewUnavailablef("failed to append history node: %v", err)
-		}
+	// The node is upserted, as the SQL stores do (INSERT ... ON DUPLICATE KEY
+	// UPDATE): history retries an append whose outcome it does not know, and the
+	// retry must succeed rather than fail with a condition error.
+	nodeSet := bson.M{
+		"shard_id":    nodeDoc.ShardID,
+		"tree_id":     nodeDoc.TreeID,
+		"branch_id":   nodeDoc.BranchID,
+		"node_id":     nodeDoc.NodeID,
+		"txn_id":      nodeDoc.TxnID,
+		"prev_txn_id": nodeDoc.PrevTxnID,
+		"events":      nodeDoc.Events,
+	}
+	branchDoc := historyBranchDocument{
+		ID:       historyBranchDocID(treeID, branchID),
+		ShardID:  request.ShardID,
+		TreeID:   treeID,
+		BranchID: branchID,
+		Info:     request.Info,
+		TreeInfo: dataBlobToDoc(request.TreeInfo),
+	}
+	branchUpdate := bson.M{
+		"$set": bson.M{
+			"shard_id":  branchDoc.ShardID,
+			"tree_id":   branchDoc.TreeID,
+			"branch_id": branchDoc.BranchID,
+			"info":      branchDoc.Info,
+			"tree_info": branchDoc.TreeInfo,
+		},
 	}
 
-	if request.IsNewBranch {
-		branchDoc := historyBranchDocument{
-			ID:       historyBranchDocID(treeID, branchID),
-			ShardID:  request.ShardID,
-			TreeID:   treeID,
-			BranchID: branchID,
-			Info:     request.Info,
-			TreeInfo: dataBlobToDoc(request.TreeInfo),
+	write := func(ctx context.Context) error {
+		if _, err := s.historyNodesCol.UpdateOne(ctx, bson.M{"_id": nodeDoc.ID}, bson.M{"$set": nodeSet}, options.Update().SetUpsert(true)); err != nil {
+			return err
 		}
-		update := bson.M{
-			"$set": bson.M{
-				"shard_id":  branchDoc.ShardID,
-				"tree_id":   branchDoc.TreeID,
-				"branch_id": branchDoc.BranchID,
-				"info":      branchDoc.Info,
-				"tree_info": branchDoc.TreeInfo,
-			},
-		}
-		opts := options.Update().SetUpsert(true)
-		if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, update, opts); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+		if request.IsNewBranch {
+			if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, branchUpdate, options.Update().SetUpsert(true)); err != nil {
+				return err
 			}
-			return serviceerror.NewUnavailablef("failed to upsert history branch: %v", err)
 		}
+		return nil
 	}
 
+	// Workflow creation and updates append their events inside their own
+	// transaction. The writes then belong to that transaction, and its errors,
+	// write conflicts included, are left for it to handle.
+	if mongo.SessionFromContext(ctx) != nil {
+		return write(ctx)
+	}
+
+	var err error
+	if request.IsNewBranch {
+		// A new branch writes its first node and its branch record together,
+		// as SQL does in one transaction: a branch must not exist without its
+		// node, nor a node without its branch.
+		_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+			return nil, write(sessCtx)
+		})
+	} else {
+		err = write(ctx)
+	}
+	if err != nil {
+		return appendHistoryNodesError(err)
+	}
 	return nil
+}
+
+// appendHistoryNodesError maps a failed append the way the SQL stores do: a
+// deadline or cancellation is an AppendHistoryTimeoutError, whose outcome is
+// unknown, and other driver errors are Unavailable.
+func appendHistoryNodesError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+	}
+	if isSizeLimitError(err) {
+		return newSizeLimitError(err)
+	}
+	if isServiceError(err) {
+		return err
+	}
+	return serviceerror.NewUnavailablef("failed to append history node: %v", err)
 }
 
 func (s *executionStore) DeleteHistoryNodes(
@@ -2762,23 +2976,8 @@ func (s *executionStore) ReadHistoryBranch(
 
 	filter := historyNodeFilter(request.ShardID, treeID, branchID, request, token)
 
-	var sortSpec bson.D
-	if request.ReverseOrder {
-		// Reverse: NodeID DESC, TxnID DESC
-		sortSpec = bson.D{
-			{Key: "node_id", Value: -1},
-			{Key: "txn_id", Value: -1},
-		}
-	} else {
-		// Forward: NodeID ASC, TxnID DESC (to satisfy history_manager.filterHistoryNodes)
-		sortSpec = bson.D{
-			{Key: "node_id", Value: 1},
-			{Key: "txn_id", Value: -1},
-		}
-	}
-
 	findOpts := options.Find().
-		SetSort(sortSpec).
+		SetSort(historyNodeSort(request.ReverseOrder)).
 		SetLimit(int64(limit))
 
 	cursor, err := s.historyNodesCol.Find(ctx, filter, findOpts)
@@ -2889,12 +3088,12 @@ func (s *executionStore) DeleteHistoryBranch(
 		return serviceerror.NewInvalidArgument("DeleteHistoryBranch missing branch info")
 	}
 
+	// SQL deletes the branch and its nodes in one transaction. A branch can have
+	// far more nodes than a MongoDB transaction should hold, so the nodes go
+	// first and the branch record last: if the delete stops half way, the branch
+	// is still listed and the history scavenger or a retry deletes the rest.
+	// Deleting the branch first would leave nodes that nothing points to.
 	branchInfo := request.BranchInfo
-	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
-	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
-		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
-	}
-
 	for _, br := range request.BranchRanges {
 		rangeFilter := bson.M{
 			"shard_id":  request.ShardID,
@@ -2909,6 +3108,10 @@ func (s *executionStore) DeleteHistoryBranch(
 		}
 	}
 
+	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
+	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
+		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
+	}
 	return nil
 }
 
@@ -3051,9 +3254,88 @@ func (s *executionStore) notImplemented(method string) error {
 	return serviceerror.NewUnimplemented(fmt.Sprintf("MongoDB ExecutionStore: %s not implemented", method))
 }
 
+// shardFenceSeqField is a counter on the shard document that exists only so
+// that the ownership fence is a real write (see fenceShardRangeID).
+const shardFenceSeqField = "fence_seq"
+
+// mongoWriteConflictCode is the server error code for a write conflict.
+const mongoWriteConflictCode = 112
+
+// errHistoryTasksAlreadyPersisted aborts an AddHistoryTasks transaction whose
+// tasks were already written by an earlier attempt.
+var errHistoryTasksAlreadyPersisted = errors.New("history tasks already persisted")
+
+// fenceShardRangeID is the write half of the shard ownership fence and must be
+// the last operation of a transaction that writes on behalf of a shard owner.
+//
+// MongoDB transactions use snapshot isolation and only detect conflicts on
+// documents they write, so reading range_id (assertShardRangeID) cannot stop a
+// stale owner from committing after the range has moved. Writing to the shard
+// document, conditional on range_id, closes that gap: if the range moved
+// before this transaction started the filter does not match, and if it moved
+// while the transaction was open the write conflicts and the transaction is
+// retried, after which the read half reports the ownership loss. This gives the
+// guarantee of the SQL stores (shared lock on the shard row) and of Cassandra
+// (IF range_id = ? in every batch).
+//
+// The update is a $inc rather than a no-op $set because an update that changes
+// nothing does not take part in conflict detection.
+//
+// Concurrency differs from SQL. A shared lock lets transactions of one shard
+// run in parallel; here every transaction writes the shard document, so two
+// transactions of the same shard whose snapshot-to-commit intervals overlap
+// conflict, and the loser is retried (see executeTransaction). The history
+// service must therefore run one persistence operation per shard at a time,
+// which is what history.shardIOConcurrency = 1 does; the shard context
+// enforces that value for MongoDB as it does for Cassandra. Running the write
+// last does not avoid such conflicts. It keeps the shard document locked only
+// until commit, so UpdateShard is not held up for the whole transaction.
+func (s *executionStore) fenceShardRangeID(
+	ctx context.Context,
+	shardID int32,
+	expectedRangeID int64,
+) error {
+	result, err := s.db.Collection(collectionShards).UpdateOne(
+		ctx,
+		bson.M{"_id": shardID, "range_id": expectedRangeID},
+		bson.M{"$inc": bson.M{shardFenceSeqField: int64(1)}},
+	)
+	if err != nil {
+		if isTransientWriteConflict(err) {
+			// Returned unwrapped so that WithTransaction retries the whole
+			// transaction on a fresh snapshot.
+			return err
+		}
+		return serviceerror.NewUnavailablef("failed to fence shard %d: %v", shardID, err)
+	}
+	if result.MatchedCount == 0 {
+		return &persistence.ShardOwnershipLostError{
+			ShardID: shardID,
+			Msg: fmt.Sprintf(
+				"Shard ownership lost. Expected RangeID: %v, shard range has changed",
+				expectedRangeID,
+			),
+		}
+	}
+	return nil
+}
+
+// isTransientWriteConflict reports whether err is a write conflict that the
+// driver may resolve by retrying the transaction.
+func isTransientWriteConflict(err error) bool {
+	var serverErr mongo.ServerError
+	if !errors.As(err, &serverErr) {
+		return false
+	}
+	return serverErr.HasErrorCode(mongoWriteConflictCode) &&
+		serverErr.HasErrorLabel("TransientTransactionError")
+}
+
 // assertShardRangeID verifies that the shard's range_id matches the expected value.
-// This provides write fencing to prevent stale shard owners from writing.
-// Must be called within a transaction context for atomicity.
+// It is the read half of the ownership fence: it fails fast and gives ownership
+// loss precedence over other errors, but on its own it does not prevent a stale
+// owner from committing. Every caller must also run fenceShardRangeID as the
+// last operation of the same transaction.
 func (s *executionStore) assertShardRangeID(
 	ctx context.Context,
 	shardID int32,

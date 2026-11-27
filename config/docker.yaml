@@ -102,6 +102,7 @@ persistence:
                 databaseName: {{ default "temporal" (env "MONGODB_DATABASE") | quote }}
                 replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") | quote }}
                 maxConns: {{ default "20" (env "MONGODB_MAX_CONNS") }}
+                disableIndexMigration: {{ default "false" (env "MONGODB_DISABLE_INDEX_MIGRATION") }}
         {{- end }}
 
         visibility:
@@ -180,6 +181,7 @@ persistence:
                 databaseName: {{ default "temporal_visibility" (env "MONGODB_DATABASE") | quote }}
                 replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") | quote }}
                 maxConns: {{ default "10" (env "MONGODB_VIS_MAX_CONNS") }}
+                disableIndexMigration: {{ default "false" (env "MONGODB_DISABLE_INDEX_MIGRATION") }}
             {{- else -}}
               {{- fail "No visibility configured. Cassandra is no longer supported for visibility." -}}
             {{- end }}

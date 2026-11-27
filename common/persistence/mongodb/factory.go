@@ -3,11 +3,9 @@ package mongodb
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
@@ -45,6 +43,14 @@ type (
 		clusterMDStore     p.ClusterMetadataStore
 		nexusEndpointStore p.NexusEndpointStore
 		visibilityStore    store.VisibilityStore
+
+		// Background index migrations, see index_migration.go. The context is
+		// nil for factories that were not built by NewFactory.
+		migrationCtx            context.Context
+		migrationCancel         context.CancelFunc
+		migrationWG             sync.WaitGroup
+		primaryMigrationOnce    sync.Once
+		visibilityMigrationOnce sync.Once
 	}
 )
 
@@ -68,7 +74,31 @@ func NewFactory(
 		return nil, fmt.Errorf("failed to initialize MongoDB factory: %w", err)
 	}
 
+	factory.migrationCtx, factory.migrationCancel = context.WithCancel(context.Background())
+
 	return factory, nil
+}
+
+// startIndexMigration runs an index migration in the background, once per
+// factory. It never blocks or fails the caller: the outcome is logged and
+// recorded in the schema_migrations collection. When index migrations are
+// disabled in the config it only reports the missing indexes.
+func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration) {
+	if f.migrationCtx == nil {
+		return
+	}
+	once.Do(func() {
+		f.migrationWG.Add(1)
+		go func() {
+			defer f.migrationWG.Done()
+			migrator := newIndexMigrator(f.database, f.logger)
+			if f.cfg.DisableIndexMigration {
+				migrator.report(f.migrationCtx, migration)
+				return
+			}
+			migrator.run(f.migrationCtx, migration)
+		}()
+	})
 }
 
 // initialize establishes MongoDB connection and detects topology
@@ -76,17 +106,11 @@ func (f *Factory) initialize() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Build connection string
-	uri := f.buildConnectionString()
-
-	// Create client options
-	clientOpts := options.Client().
-		ApplyURI(uri).
-		SetConnectTimeout(f.cfg.ConnectTimeout).
-		SetServerSelectionTimeout(f.cfg.ConnectTimeout).
-		SetHeartbeatInterval(10 * time.Second).
-		SetRetryReads(true).
-		SetRetryWrites(true)
+	clientOpts := buildClientOptions(f.cfg)
+	for name, value := range ignoredConsistencySettings(f.cfg) {
+		f.logger.Warn("MongoDB "+name+" in the persistence config is ignored: reads always use the primary and writes use the write concern of the MongoDB deployment (setDefaultRWConcern)",
+			tag.NewStringTag(name, value))
+	}
 
 	if f.cfg.MaxConns > 0 {
 		clientOpts.SetMaxPoolSize(uint64(f.cfg.MaxConns))
@@ -119,7 +143,7 @@ func (f *Factory) initialize() error {
 	}
 
 	// Create client
-	mongoClient, err := client.NewClient(ctx, uri, clientOpts)
+	mongoClient, err := client.NewClientFromOptions(ctx, clientOpts, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create MongoDB client: %w", err)
 	}
@@ -156,40 +180,15 @@ func (f *Factory) initialize() error {
 	return nil
 }
 
-// buildConnectionString constructs MongoDB connection URI
-func (f *Factory) buildConnectionString() string {
-	uri := "mongodb://"
-
-	// Add credentials if provided
-	if f.cfg.User != "" && f.cfg.Password != "" {
-		uri += fmt.Sprintf("%s:%s@", f.cfg.User, f.cfg.Password)
-	}
-
-	// Add hosts
-	uri += strings.Join(f.cfg.Hosts, ",")
-
-	// Add database name
-	uri += "/" + f.cfg.DatabaseName
-
-	// Add options
-	var opts []string
-
-	if f.cfg.ReplicaSet != "" {
-		opts = append(opts, fmt.Sprintf("replicaSet=%s", f.cfg.ReplicaSet))
-	}
-	if f.cfg.AuthSource != "" {
-		opts = append(opts, fmt.Sprintf("authSource=%s", f.cfg.AuthSource))
-	}
-
-	if len(opts) > 0 {
-		uri += "?" + strings.Join(opts, "&")
-	}
-
-	return uri
-}
-
 // Close closes the factory and underlying connections
 func (f *Factory) Close() {
+	// Stop background index migrations before the client goes away. An
+	// interrupted migration releases its lease and continues on a later start.
+	if f.migrationCancel != nil {
+		f.migrationCancel()
+		f.migrationWG.Wait()
+	}
+
 	if f.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -214,6 +213,7 @@ func (f *Factory) NewTaskStore() (p.TaskStore, error) {
 		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
@@ -238,6 +238,7 @@ func (f *Factory) NewFairTaskStore() (p.TaskStore, error) {
 		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
@@ -283,8 +284,10 @@ func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
 
 	metadataStore, err := NewMetadataStore(
 		f.database,
+		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
@@ -317,6 +320,7 @@ func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
 	}
 
 	f.executionStore = executionStore
+	f.startIndexMigration(&f.primaryMigrationOnce, primaryIndexMigration())
 	return executionStore, nil
 }
 
@@ -400,6 +404,7 @@ func (f *Factory) NewVisibilityStore(
 		return nil, err
 	}
 
+	f.startIndexMigration(&f.visibilityMigrationOnce, visibilityIndexMigration())
 	return visStore, nil
 }
 

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -248,17 +250,12 @@ func (s *visibilityStore) RecordWorkflowExecutionStarted(ctx context.Context, re
 	doc.HistorySizeBytes = nil
 	doc.StateTransitionCount = nil
 
-	_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		_, err := s.executionsCol.InsertOne(sessCtx, doc)
-		if err != nil {
-			if mongo.IsDuplicateKeyError(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		return nil, nil
-	})
-	if err != nil {
+	// A single-document insert is atomic and runs without a transaction: a
+	// duplicate key error aborts a MongoDB transaction, so ignoring it there
+	// leaves the driver retrying an aborted transaction until it times out.
+	// A duplicate key means a record for this execution already exists, which
+	// makes the start record a no-op (the SQL stores do the same).
+	if _, err := s.executionsCol.InsertOne(ctx, doc); err != nil && !mongo.IsDuplicateKeyError(err) {
 		return serviceerror.NewUnavailablef("failed to insert visibility execution: %v", err)
 	}
 	return nil
@@ -274,11 +271,9 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 		return err
 	}
 
-	removedTransient, err := s.stripTransientSearchAttributes(doc)
-	if err != nil {
+	if _, err := s.stripTransientSearchAttributes(doc); err != nil {
 		return err
 	}
-	shouldUnsetTransient := removedTransient || enumspb.WorkflowExecutionStatus(doc.Status) != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
 
 	closeTime := request.CloseTime.UTC()
 	doc.CloseTime = &closeTime
@@ -296,17 +291,9 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 	stateTransitions := request.StateTransitionCount
 	doc.StateTransitionCount = &stateTransitions
 
-	updateSet, err := visibilityDocumentUpdate(doc)
+	updateOps, err := visibilityDocumentUpdate(doc)
 	if err != nil {
 		return err
-	}
-
-	updateOps := bson.M{
-		"$set":         updateSet,
-		"$setOnInsert": bson.M{"_id": doc.ID},
-	}
-	if shouldUnsetTransient {
-		updateOps["$unset"] = bson.M{sadefs.TemporalPauseInfo: ""}
 	}
 
 	filter := bson.M{"_id": doc.ID}
@@ -315,15 +302,7 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 		filter["status"] = bson.M{"$in": []int32{0, int32(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING)}}
 	}
 
-	_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		_, err := s.executionsCol.UpdateOne(sessCtx,
-			filter,
-			updateOps,
-			options.Update().SetUpsert(true),
-		)
-		return nil, err
-	})
-	if err != nil {
+	if err := s.upsertGuardedExecution(ctx, doc.ID, filter, updateOps); err != nil {
 		return serviceerror.NewUnavailablef("failed to upsert closed visibility execution: %v", err)
 	}
 	return nil
@@ -341,39 +320,97 @@ func (s *visibilityStore) UpsertWorkflowExecution(ctx context.Context, request *
 
 	doc.VisibilityTime = doc.StartTime
 
-	removedTransient, err := s.stripTransientSearchAttributes(doc)
+	if _, err := s.stripTransientSearchAttributes(doc); err != nil {
+		return err
+	}
+
+	updateOps, err := visibilityDocumentUpdate(doc)
 	if err != nil {
 		return err
 	}
 
-	updateSet, err := visibilityDocumentUpdate(doc)
-	if err != nil {
-		return err
+	filter := bson.M{
+		"_id": doc.ID,
+		"$or": versionMatchClauses(doc.Version),
 	}
-
-	updateOps := bson.M{
-		"$set":         updateSet,
-		"$setOnInsert": bson.M{"_id": doc.ID},
-	}
-	if removedTransient {
-		updateOps["$unset"] = bson.M{sadefs.TemporalPauseInfo: ""}
-	}
-
-	_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		_, err := s.executionsCol.UpdateOne(sessCtx,
-			bson.M{
-				"_id": doc.ID,
-				"$or": versionMatchClauses(doc.Version),
-			},
-			updateOps,
-			options.Update().SetUpsert(true),
-		)
-		return nil, err
-	})
-	if err != nil {
+	if err := s.upsertGuardedExecution(ctx, doc.ID, filter, updateOps); err != nil {
 		return serviceerror.NewUnavailablef("failed to upsert visibility execution: %v", err)
 	}
 	return nil
+}
+
+// visibilityUpsertMaxAttempts bounds the retries of a guarded upsert that keeps
+// losing the insert race to concurrent writers of the same execution.
+const visibilityUpsertMaxAttempts = 5
+
+// upsertGuardedExecution applies an upsert whose filter carries a guard (the
+// record version, and for some writes the status) in addition to the _id.
+//
+// When the record exists but the guard does not match it, the upsert falls
+// through to an insert and fails with a duplicate key error. That has two
+// possible causes, which are told apart by reading the record back:
+//   - the stored record is newer than this write. Visibility tasks can be
+//     processed out of order and more than once, so the write is stale and is
+//     dropped without an error, as the SQL stores do with their _version column.
+//   - another writer created the record between this write's match and its
+//     insert. The write is not stale and is retried against the new record.
+//
+// The upsert is a single-document operation and runs without a transaction.
+func (s *visibilityStore) upsertGuardedExecution(
+	ctx context.Context,
+	docID string,
+	filter bson.M,
+	updateOps bson.M,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < visibilityUpsertMaxAttempts; attempt++ {
+		_, err := s.executionsCol.UpdateOne(ctx, filter, updateOps, options.Update().SetUpsert(true))
+		if err == nil {
+			return nil
+		}
+		if !mongo.IsDuplicateKeyError(err) {
+			return err
+		}
+		lastErr = err
+
+		rejected, err := s.guardRejectsExecutionWrite(ctx, docID, filter)
+		if err != nil {
+			return err
+		}
+		if rejected {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+// guardRejectsExecutionWrite reports whether the record docID exists and is
+// not matched by filter, i.e. whether the stored record rejects the write.
+func (s *visibilityStore) guardRejectsExecutionWrite(
+	ctx context.Context,
+	docID string,
+	filter bson.M,
+) (bool, error) {
+	idOnly := options.FindOne().SetProjection(bson.M{"_id": 1})
+
+	err := s.executionsCol.FindOne(ctx, filter, idOnly).Err()
+	if err == nil {
+		// The record matches now: it was created concurrently, retry the write.
+		return false, nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return false, err
+	}
+
+	err = s.executionsCol.FindOne(ctx, bson.M{"_id": docID}, idOnly).Err()
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		// The record was deleted in the meantime: retry, the upsert can insert.
+		return false, nil
+	}
+	return false, err
 }
 
 func (s *visibilityStore) DeleteWorkflowExecution(ctx context.Context, request *manager.VisibilityDeleteWorkflowExecutionRequest) error {
@@ -985,8 +1022,14 @@ func (s *visibilityStore) convertQueryParams(
 		mapper,
 	).WithChasmMapper(chasmMapper).WithArchetypeID(archetypeID)
 
+	// Query errors are the caller's: report them as InvalidArgument, as the
+	// SQL store does.
 	params, err := converter.Convert(queryString)
 	if err != nil {
+		var converterErr *query.ConverterError
+		if errors.As(err, &converterErr) {
+			return nil, converterErr.ToInvalidArgument()
+		}
 		return nil, err
 	}
 	return params, nil
@@ -1250,18 +1293,57 @@ func mongoAnd(filters ...bson.M) bson.M {
 	return bson.M{"$and": flattened}
 }
 
+// visibilityOptionalFields lists the BSON fields of visibilityExecutionDocument
+// that are left out when empty (omitempty).
+var visibilityOptionalFields = func() []string {
+	var fields []string
+	t := reflect.TypeOf(visibilityExecutionDocument{})
+	for i := 0; i < t.NumField(); i++ {
+		name, opts, _ := strings.Cut(t.Field(i).Tag.Get("bson"), ",")
+		if name == "" || name == "_id" {
+			continue
+		}
+		for _, opt := range strings.Split(opts, ",") {
+			if opt == "omitempty" {
+				fields = append(fields, name)
+				break
+			}
+		}
+	}
+	return fields
+}()
+
+// visibilityDocumentUpdate builds the update that makes a stored record equal
+// to doc, as the SQL stores do by replacing the whole row: fields doc carries
+// are set and optional fields it leaves out are removed. Without the $unset a
+// cleared memo, parent or close time, or search attributes that dropped to
+// none, would keep their old values.
 func visibilityDocumentUpdate(doc *visibilityExecutionDocument) (bson.M, error) {
 	raw, err := bson.Marshal(doc)
 	if err != nil {
 		return nil, serviceerror.NewInternalf("failed to marshal visibility document: %v", err)
 	}
 
-	var m bson.M
-	if err := bson.Unmarshal(raw, &m); err != nil {
+	var set bson.M
+	if err := bson.Unmarshal(raw, &set); err != nil {
 		return nil, serviceerror.NewInternalf("failed to unmarshal visibility document: %v", err)
 	}
-	delete(m, "_id")
-	return m, nil
+	delete(set, "_id")
+
+	update := bson.M{
+		"$set":         set,
+		"$setOnInsert": bson.M{"_id": doc.ID},
+	}
+	unset := bson.M{}
+	for _, field := range visibilityOptionalFields {
+		if _, ok := set[field]; !ok {
+			unset[field] = ""
+		}
+	}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	return update, nil
 }
 
 func documentToExecutionInfo(doc *visibilityExecutionDocument, saTypeMap searchattribute.NameTypeMap) (*store.InternalExecutionInfo, error) {

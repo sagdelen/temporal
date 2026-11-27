@@ -469,6 +469,7 @@ func TestCreateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
@@ -503,7 +504,8 @@ func TestCreateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 
 	_, err := store.CreateWorkflowExecution(ctx, req)
 	require.NoError(t, err)
-	require.Len(t, historyCol.insertDocs, 1)
+	// History nodes are upserted.
+	require.Len(t, historyCol.updateFilters, 1)
 }
 
 func TestUpdateWorkflowExecution_AppendsNewEvents(t *testing.T) {
@@ -523,6 +525,7 @@ func TestUpdateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
@@ -574,7 +577,8 @@ func TestUpdateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 	}
 
 	require.NoError(t, store.UpdateWorkflowExecution(ctx, req))
-	require.Len(t, historyCol.insertDocs, 2)
+	// History nodes are upserted.
+	require.Len(t, historyCol.updateFilters, 2)
 }
 
 func TestConflictResolveWorkflowExecution_AppendsNewEvents(t *testing.T) {
@@ -596,6 +600,7 @@ func TestConflictResolveWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
@@ -655,14 +660,17 @@ func TestConflictResolveWorkflowExecution_AppendsNewEvents(t *testing.T) {
 	}
 
 	require.NoError(t, store.ConflictResolveWorkflowExecution(ctx, req))
-	require.Len(t, historyCol.insertDocs, 3)
+	// History nodes are upserted.
+	require.Len(t, historyCol.updateFilters, 3)
 }
 
 func TestAppendHistoryNodes_NewBranch(t *testing.T) {
 	ctx := context.Background()
 	nodesCol := newFakeCollection(t)
 	branchesCol := newFakeCollection(t)
+	mongoClient := &fakeMongoClient{}
 	store := &executionStore{
+		transactionalStore: transactionalStore{client: mongoClient, metricsHandler: metrics.NoopMetricsHandler},
 		historyNodesCol:    nodesCol,
 		historyBranchesCol: branchesCol,
 		serializer:         serialization.NewSerializer(),
@@ -687,13 +695,19 @@ func TestAppendHistoryNodes_NewBranch(t *testing.T) {
 	}
 
 	require.NoError(t, store.AppendHistoryNodes(ctx, req))
-	require.Len(t, nodesCol.insertDocs, 1)
-	nodeDoc, ok := nodesCol.insertDocs[0].(historyNodeDocument)
+	// The node and the branch are written in one transaction.
+	require.Len(t, mongoClient.sessions, 1)
+
+	// The node is upserted, so a retried append succeeds.
+	require.Len(t, nodesCol.updateFilters, 1)
+	require.Equal(t, bson.M{"_id": historyNodeDocID("tree", "branch", 5, 7)}, nodesCol.updateFilters[0])
+	nodeSet := nodesCol.updateUpdates[0].(bson.M)["$set"].(bson.M)
+	require.Equal(t, int64(5), nodeSet["node_id"])
+	require.Equal(t, int64(7), nodeSet["txn_id"])
+	require.Equal(t, int64(3), nodeSet["prev_txn_id"])
+	events, ok := nodeSet["events"].(*dataBlobDoc)
 	require.True(t, ok)
-	require.Equal(t, int64(5), nodeDoc.NodeID)
-	require.Equal(t, int64(7), nodeDoc.TxnID)
-	require.NotNil(t, nodeDoc.Events)
-	require.Equal(t, []byte("events"), nodeDoc.Events.Data)
+	require.Equal(t, []byte("events"), events.Data)
 
 	require.Len(t, branchesCol.updateFilters, 1)
 	filter, ok := branchesCol.updateFilters[0].(bson.M)
