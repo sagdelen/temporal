@@ -88,13 +88,6 @@ type (
 		CassandraBlob *dataBlobDoc `bson:"cassandra_blob,omitempty"`
 	}
 
-	historyTaskDoc struct {
-		CategoryID int          `bson:"category_id"`
-		FireTime   time.Time    `bson:"fire_time"`
-		TaskID     int64        `bson:"task_id"`
-		Blob       *dataBlobDoc `bson:"blob,omitempty"`
-	}
-
 	historyBranchDocument struct {
 		ID       string       `bson:"_id"`
 		ShardID  int32        `bson:"shard_id"`
@@ -142,36 +135,35 @@ type (
 	}
 
 	executionDocument struct {
-		ID                   string           `bson:"_id"`
-		ShardID              int32            `bson:"shard_id"`
-		NamespaceID          string           `bson:"namespace_id"`
-		WorkflowID           string           `bson:"workflow_id"`
-		RunID                string           `bson:"run_id"`
-		NextEventID          int64            `bson:"next_event_id"`
-		DBRecordVersion      int64            `bson:"db_record_version"`
-		LastWriteVersion     int64            `bson:"last_write_version"`
-		StartVersion         int64            `bson:"start_version"`
-		State                int32            `bson:"state"`
-		Status               int32            `bson:"status"`
-		Condition            int64            `bson:"condition"`
-		StateTransitionCount int64            `bson:"state_transition_count,omitempty"`
-		CreateRequestID      string           `bson:"create_request_id,omitempty"`
-		UpdateTime           time.Time        `bson:"update_time"`
-		StartTime            *time.Time       `bson:"start_time,omitempty"`
-		ExecutionTime        *time.Time       `bson:"execution_time,omitempty"`
-		VisibilityTime       *time.Time       `bson:"visibility_time,omitempty"`
-		ExecutionInfo        *dataBlobDoc     `bson:"execution_info"`
-		ExecutionState       *dataBlobDoc     `bson:"execution_state"`
-		ActivityInfos        []int64BlobDoc   `bson:"activity_infos,omitempty"`
-		TimerInfos           []stringBlobDoc  `bson:"timer_infos,omitempty"`
-		ChildExecutionInfos  []int64BlobDoc   `bson:"child_execution_infos,omitempty"`
-		RequestCancelInfos   []int64BlobDoc   `bson:"request_cancel_infos,omitempty"`
-		SignalInfos          []int64BlobDoc   `bson:"signal_infos,omitempty"`
-		SignalRequestedIDs   []string         `bson:"signal_requested_ids,omitempty"`
-		ChasmNodes           []chasmNodeDoc   `bson:"chasm_nodes,omitempty"`
-		BufferedEvents       bufferedBatches  `bson:"buffered_events,omitempty"`
-		Tasks                []historyTaskDoc `bson:"tasks,omitempty"`
-		Checksum             *dataBlobDoc     `bson:"checksum,omitempty"`
+		ID                   string          `bson:"_id"`
+		ShardID              int32           `bson:"shard_id"`
+		NamespaceID          string          `bson:"namespace_id"`
+		WorkflowID           string          `bson:"workflow_id"`
+		RunID                string          `bson:"run_id"`
+		NextEventID          int64           `bson:"next_event_id"`
+		DBRecordVersion      int64           `bson:"db_record_version"`
+		LastWriteVersion     int64           `bson:"last_write_version"`
+		StartVersion         int64           `bson:"start_version"`
+		State                int32           `bson:"state"`
+		Status               int32           `bson:"status"`
+		Condition            int64           `bson:"condition"`
+		StateTransitionCount int64           `bson:"state_transition_count,omitempty"`
+		CreateRequestID      string          `bson:"create_request_id,omitempty"`
+		UpdateTime           time.Time       `bson:"update_time"`
+		StartTime            *time.Time      `bson:"start_time,omitempty"`
+		ExecutionTime        *time.Time      `bson:"execution_time,omitempty"`
+		VisibilityTime       *time.Time      `bson:"visibility_time,omitempty"`
+		ExecutionInfo        *dataBlobDoc    `bson:"execution_info"`
+		ExecutionState       *dataBlobDoc    `bson:"execution_state"`
+		ActivityInfos        []int64BlobDoc  `bson:"activity_infos,omitempty"`
+		TimerInfos           []stringBlobDoc `bson:"timer_infos,omitempty"`
+		ChildExecutionInfos  []int64BlobDoc  `bson:"child_execution_infos,omitempty"`
+		RequestCancelInfos   []int64BlobDoc  `bson:"request_cancel_infos,omitempty"`
+		SignalInfos          []int64BlobDoc  `bson:"signal_infos,omitempty"`
+		SignalRequestedIDs   []string        `bson:"signal_requested_ids,omitempty"`
+		ChasmNodes           []chasmNodeDoc  `bson:"chasm_nodes,omitempty"`
+		BufferedEvents       bufferedBatches `bson:"buffered_events,omitempty"`
+		Checksum             *dataBlobDoc    `bson:"checksum,omitempty"`
 	}
 
 	currentExecutionDocument struct {
@@ -427,34 +419,6 @@ func mapSignalRequestedIDs(ids map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func mapHistoryTasks(tasksByCategory map[taskspkg.Category][]persistence.InternalHistoryTask) []historyTaskDoc {
-	if len(tasksByCategory) == 0 {
-		return nil
-	}
-	docs := make([]historyTaskDoc, 0)
-	for category, taskList := range tasksByCategory {
-		categoryID := category.ID()
-		for _, task := range taskList {
-			docs = append(docs, historyTaskDoc{
-				CategoryID: categoryID,
-				FireTime:   task.Key.FireTime.UTC(),
-				TaskID:     task.Key.TaskID,
-				Blob:       dataBlobToDoc(task.Blob),
-			})
-		}
-	}
-	sort.Slice(docs, func(i, j int) bool {
-		if docs[i].CategoryID != docs[j].CategoryID {
-			return docs[i].CategoryID < docs[j].CategoryID
-		}
-		if docs[i].FireTime.Equal(docs[j].FireTime) {
-			return docs[i].TaskID < docs[j].TaskID
-		}
-		return docs[i].FireTime.Before(docs[j].FireTime)
-	})
-	return docs
 }
 
 func dataBlobDocToBlob(doc *dataBlobDoc) *commonpb.DataBlob {
@@ -978,6 +942,13 @@ func decodeHistoryBranchListToken(data []byte) (historyBranchListPageToken, erro
 	return token, nil
 }
 
+// executionDocumentUpdate wraps the $set of an execution document update.
+// Execution documents written before this release carry a "tasks" array that
+// nothing reads; every update removes it so documents shrink back over time.
+func executionDocumentUpdate(set bson.M) bson.M {
+	return bson.M{"$set": set, "$unset": bson.M{"tasks": ""}}
+}
+
 func executionDocumentUpdateSet(doc *executionDocument) bson.M {
 	return bson.M{
 		"run_id":                 doc.RunID,
@@ -1003,7 +974,6 @@ func executionDocumentUpdateSet(doc *executionDocument) bson.M {
 		"signal_requested_ids":   doc.SignalRequestedIDs,
 		"chasm_nodes":            doc.ChasmNodes,
 		"buffered_events":        doc.BufferedEvents,
-		"tasks":                  doc.Tasks,
 		"checksum":               doc.Checksum,
 		"state_transition_count": doc.StateTransitionCount,
 	}
@@ -1175,11 +1145,6 @@ func (s *executionStore) applyMutationToExecutionDocument(
 		doc.BufferedEvents = appendBufferedBatch(doc.BufferedEvents, *newBatch)
 	}
 
-	// Tasks (best effort only tracked for observability in this stub).
-	if len(mutation.Tasks) > 0 {
-		doc.Tasks = mapHistoryTasks(mutation.Tasks)
-	}
-
 	doc.Checksum = dataBlobToDoc(mutation.Checksum)
 }
 
@@ -1349,7 +1314,7 @@ func (s *executionStore) applyWorkflowMutation(
 		"db_record_version": oldVersion,
 	}
 	updateSet := executionDocumentUpdateSet(doc)
-	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
+	result, err := s.executionsCol.UpdateOne(ctx, filter, executionDocumentUpdate(updateSet))
 	if err != nil {
 		return nil, serviceerror.NewUnavailablef("failed to update execution document: %v", err)
 	}
@@ -1514,7 +1479,6 @@ func (s *executionStore) buildExecutionDocument(request *persistence.InternalCre
 		SignalInfos:         mapInt64Blobs(snapshot.SignalInfos),
 		SignalRequestedIDs:  mapSignalRequestedIDs(snapshot.SignalRequestedIDs),
 		ChasmNodes:          mapChasmNodes(snapshot.ChasmNodes),
-		Tasks:               mapHistoryTasks(snapshot.Tasks),
 		Checksum:            dataBlobToDoc(snapshot.Checksum),
 	}
 
@@ -2048,7 +2012,7 @@ func (s *executionStore) applyConflictResolveWorkflowExecution(
 		"db_record_version": existing.DBRecordVersion,
 	}
 	updateSet := executionDocumentUpdateSet(resetDoc)
-	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
+	result, err := s.executionsCol.UpdateOne(ctx, filter, executionDocumentUpdate(updateSet))
 	if err != nil {
 		return serviceerror.NewUnavailablef("failed to reset execution document: %v", err)
 	}
@@ -2296,7 +2260,7 @@ func (s *executionStore) SetWorkflowExecution(
 			"_id":               newDoc.ID,
 			"db_record_version": existing.DBRecordVersion,
 		}
-		update := bson.M{"$set": executionDocumentUpdateSet(newDoc)}
+		update := executionDocumentUpdate(executionDocumentUpdateSet(newDoc))
 		result, err := s.executionsCol.UpdateOne(sessCtx, filter, update)
 		if err != nil {
 			return nil, serviceerror.NewUnavailablef("failed to set workflow execution: %v", err)
