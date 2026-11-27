@@ -500,6 +500,8 @@ func taskKeySpecified(key taskspkg.Key) bool {
 	return !key.FireTime.IsZero() || key.TaskID != 0
 }
 
+// insertHistoryTaskDoc inserts a history task and treats an already existing
+// task with the same key as success.
 func (s *executionStore) insertHistoryTaskDoc(
 	ctx context.Context,
 	col client.Collection,
@@ -508,8 +510,22 @@ func (s *executionStore) insertHistoryTaskDoc(
 	shardID int32,
 	task persistence.InternalHistoryTask,
 ) error {
+	_, err := s.tryInsertHistoryTaskDoc(ctx, col, categoryType, categoryID, shardID, task)
+	return err
+}
+
+// tryInsertHistoryTaskDoc inserts a history task. duplicate is true when a
+// task with the same key already exists; nothing is written in that case.
+func (s *executionStore) tryInsertHistoryTaskDoc(
+	ctx context.Context,
+	col client.Collection,
+	categoryType taskspkg.CategoryType,
+	categoryID int,
+	shardID int32,
+	task persistence.InternalHistoryTask,
+) (bool, error) {
 	if err := taskspkg.ValidateKey(task.Key); err != nil {
-		return serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
+		return false, serviceerror.NewInvalidArgument(fmt.Sprintf("invalid task key: %v", err))
 	}
 
 	blobDoc := dataBlobToDoc(task.Blob)
@@ -525,9 +541,9 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert immediate task: %v", err)
 		}
 	case taskspkg.CategoryTypeScheduled:
 		doc := scheduledTaskDocument{
@@ -540,14 +556,14 @@ func (s *executionStore) insertHistoryTaskDoc(
 		}
 		if _, err := col.InsertOne(ctx, doc); err != nil {
 			if mongo.IsDuplicateKeyError(err) {
-				return nil
+				return true, nil
 			}
-			return serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
+			return false, serviceerror.NewUnavailablef("failed to insert scheduled task: %v", err)
 		}
 	default:
-		return serviceerror.NewInternalf("unknown task category type: %v", categoryType)
+		return false, serviceerror.NewInternalf("unknown task category type: %v", categoryType)
 	}
-	return nil
+	return false, nil
 }
 
 func (s *executionStore) insertWorkflowTasks(
@@ -1234,6 +1250,9 @@ func (s *executionStore) applyWorkflowMutation(
 	updateSet := executionDocumentUpdateSet(doc)
 	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
 	if err != nil {
+		if isSizeLimitError(err) {
+			return nil, newSizeLimitError(err)
+		}
 		return nil, serviceerror.NewUnavailablef("failed to update execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
@@ -1620,6 +1639,9 @@ func (s *executionStore) insertExecutionDocument(ctx context.Context, doc *execu
 		if mongo.IsDuplicateKeyError(err) {
 			return &persistence.WorkflowConditionFailedError{Msg: "workflow execution already exists"}
 		}
+		if isSizeLimitError(err) {
+			return newSizeLimitError(err)
+		}
 		return serviceerror.NewUnavailablef("failed to insert execution document: %v", err)
 	}
 	return nil
@@ -1715,7 +1737,8 @@ func (s *executionStore) CreateWorkflowExecution(
 	}
 
 	fn := func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1746,6 +1769,10 @@ func (s *executionStore) CreateWorkflowExecution(
 			if err := s.AppendHistoryNodes(sessCtx, appendReq); err != nil {
 				return nil, err
 			}
+		}
+
+		if err := s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
+			return nil, err
 		}
 
 		return &persistence.InternalCreateWorkflowExecutionResponse{}, nil
@@ -1779,7 +1806,8 @@ func (s *executionStore) UpdateWorkflowExecution(
 	}
 
 	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1793,7 +1821,11 @@ func (s *executionStore) UpdateWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, s.applyUpdateWorkflowExecution(sessCtx, request)
+		if err := s.applyUpdateWorkflowExecution(sessCtx, request); err != nil {
+			return nil, err
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 	return err
 }
@@ -1836,7 +1868,8 @@ func (s *executionStore) ConflictResolveWorkflowExecution(
 	}
 
 	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -1851,7 +1884,11 @@ func (s *executionStore) ConflictResolveWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, s.applyConflictResolveWorkflowExecution(sessCtx, request)
+		if err := s.applyConflictResolveWorkflowExecution(sessCtx, request); err != nil {
+			return nil, err
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 	return err
 }
@@ -2127,7 +2164,8 @@ func (s *executionStore) SetWorkflowExecution(
 	newDoc.UpdateTime = time.Now().UTC()
 
 	_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Write fence: verify shard ownership before any writes
+		// Fence, read half: fail fast if shard ownership is already lost.
+		// The write half (fenceShardRangeID) runs last in the transaction.
 		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
 			return nil, err
 		}
@@ -2167,6 +2205,9 @@ func (s *executionStore) SetWorkflowExecution(
 		update := bson.M{"$set": executionDocumentUpdateSet(newDoc)}
 		result, err := s.executionsCol.UpdateOne(sessCtx, filter, update)
 		if err != nil {
+			if isSizeLimitError(err) {
+				return nil, newSizeLimitError(err)
+			}
 			return nil, serviceerror.NewUnavailablef("failed to set workflow execution: %v", err)
 		}
 		if result.MatchedCount == 0 {
@@ -2177,7 +2218,7 @@ func (s *executionStore) SetWorkflowExecution(
 			return nil, err
 		}
 
-		return nil, nil
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
 	})
 
 	return err
@@ -2264,24 +2305,92 @@ func (s *executionStore) AddHistoryTasks(
 		return nil
 	}
 
+	_, err := s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+		// Fence, read half: fail fast if shard ownership is already lost.
+		if err := s.assertShardRangeID(sessCtx, request.ShardID, request.RangeID); err != nil {
+			return nil, err
+		}
+
+		for category, taskList := range request.Tasks {
+			if len(taskList) == 0 {
+				continue
+			}
+
+			col, categoryID, categoryType, err := s.taskCollectionForCategory(category)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, task := range taskList {
+				duplicate, err := s.tryInsertHistoryTaskDoc(sessCtx, col, categoryType, categoryID, request.ShardID, task)
+				if err != nil {
+					return nil, err
+				}
+				if duplicate {
+					// A duplicate key error aborts the MongoDB transaction, so
+					// nothing of this attempt is written. Leave the transaction
+					// and find out below whether the whole batch is there.
+					return nil, errHistoryTasksAlreadyPersisted
+				}
+			}
+		}
+
+		return nil, s.fenceShardRangeID(sessCtx, request.ShardID, request.RangeID)
+	})
+	if errors.Is(err, errHistoryTasksAlreadyPersisted) {
+		// The batch is written atomically, so if an earlier attempt of this
+		// request committed, every task of it exists and the request is done.
+		// Anything else is a task key collision with a different write: this
+		// batch was not written, and reporting success would lose its tasks.
+		persisted, checkErr := s.historyTasksPersisted(ctx, request)
+		if checkErr != nil {
+			return checkErr
+		}
+		if persisted {
+			return nil
+		}
+		return serviceerror.NewUnavailablef(
+			"history task already exists and the batch was not written. shard: %v", request.ShardID)
+	}
+	return err
+}
+
+// historyTasksPersisted reports whether every task of the request exists.
+func (s *executionStore) historyTasksPersisted(
+	ctx context.Context,
+	request *persistence.InternalAddHistoryTasksRequest,
+) (bool, error) {
 	for category, taskList := range request.Tasks {
 		if len(taskList) == 0 {
 			continue
 		}
-
 		col, categoryID, categoryType, err := s.taskCollectionForCategory(category)
 		if err != nil {
-			return err
+			return false, err
 		}
 
+		ids := make([]string, 0, len(taskList))
+		seen := make(map[string]struct{}, len(taskList))
 		for _, task := range taskList {
-			if err := s.insertHistoryTaskDoc(ctx, col, categoryType, categoryID, request.ShardID, task); err != nil {
-				return err
+			id := immediateDocIDForKey(request.ShardID, categoryID, task.Key)
+			if categoryType == taskspkg.CategoryTypeScheduled {
+				id = scheduledDocIDForKey(request.ShardID, categoryID, task.Key)
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
 			}
 		}
-	}
 
-	return nil
+		count, err := col.CountDocuments(ctx, bson.M{"_id": bson.M{"$in": ids}})
+		if err != nil {
+			return false, serviceerror.NewUnavailablef("failed to check history tasks: %v", err)
+		}
+		if count != int64(len(ids)) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *executionStore) GetHistoryTasks(
@@ -2666,45 +2775,86 @@ func (s *executionStore) AppendHistoryNodes(
 		Events:    dataBlobToDoc(node.Events),
 	}
 
-	if _, err := s.historyNodesCol.InsertOne(ctx, nodeDoc); err != nil {
-		switch {
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-			return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
-		case mongo.IsDuplicateKeyError(err):
-			return &persistence.ConditionFailedError{Msg: "history node already exists"}
-		default:
-			return serviceerror.NewUnavailablef("failed to append history node: %v", err)
-		}
+	// The node is upserted, as the SQL stores do (INSERT ... ON DUPLICATE KEY
+	// UPDATE): history retries an append whose outcome it does not know, and the
+	// retry must succeed rather than fail with a condition error.
+	nodeSet := bson.M{
+		"shard_id":    nodeDoc.ShardID,
+		"tree_id":     nodeDoc.TreeID,
+		"branch_id":   nodeDoc.BranchID,
+		"node_id":     nodeDoc.NodeID,
+		"txn_id":      nodeDoc.TxnID,
+		"prev_txn_id": nodeDoc.PrevTxnID,
+		"events":      nodeDoc.Events,
+	}
+	branchDoc := historyBranchDocument{
+		ID:       historyBranchDocID(treeID, branchID),
+		ShardID:  request.ShardID,
+		TreeID:   treeID,
+		BranchID: branchID,
+		Info:     request.Info,
+		TreeInfo: dataBlobToDoc(request.TreeInfo),
+	}
+	branchUpdate := bson.M{
+		"$set": bson.M{
+			"shard_id":  branchDoc.ShardID,
+			"tree_id":   branchDoc.TreeID,
+			"branch_id": branchDoc.BranchID,
+			"info":      branchDoc.Info,
+			"tree_info": branchDoc.TreeInfo,
+		},
 	}
 
-	if request.IsNewBranch {
-		branchDoc := historyBranchDocument{
-			ID:       historyBranchDocID(treeID, branchID),
-			ShardID:  request.ShardID,
-			TreeID:   treeID,
-			BranchID: branchID,
-			Info:     request.Info,
-			TreeInfo: dataBlobToDoc(request.TreeInfo),
+	write := func(ctx context.Context) error {
+		if _, err := s.historyNodesCol.UpdateOne(ctx, bson.M{"_id": nodeDoc.ID}, bson.M{"$set": nodeSet}, options.Update().SetUpsert(true)); err != nil {
+			return err
 		}
-		update := bson.M{
-			"$set": bson.M{
-				"shard_id":  branchDoc.ShardID,
-				"tree_id":   branchDoc.TreeID,
-				"branch_id": branchDoc.BranchID,
-				"info":      branchDoc.Info,
-				"tree_info": branchDoc.TreeInfo,
-			},
-		}
-		opts := options.Update().SetUpsert(true)
-		if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, update, opts); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+		if request.IsNewBranch {
+			if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, branchUpdate, options.Update().SetUpsert(true)); err != nil {
+				return err
 			}
-			return serviceerror.NewUnavailablef("failed to upsert history branch: %v", err)
 		}
+		return nil
 	}
 
+	// Workflow creation and updates append their events inside their own
+	// transaction. The writes then belong to that transaction, and its errors,
+	// write conflicts included, are left for it to handle.
+	if mongo.SessionFromContext(ctx) != nil {
+		return write(ctx)
+	}
+
+	var err error
+	if request.IsNewBranch {
+		// A new branch writes its first node and its branch record together,
+		// as SQL does in one transaction: a branch must not exist without its
+		// node, nor a node without its branch.
+		_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+			return nil, write(sessCtx)
+		})
+	} else {
+		err = write(ctx)
+	}
+	if err != nil {
+		return appendHistoryNodesError(err)
+	}
 	return nil
+}
+
+// appendHistoryNodesError maps a failed append the way the SQL stores do: a
+// deadline or cancellation is an AppendHistoryTimeoutError, whose outcome is
+// unknown, and other driver errors are Unavailable.
+func appendHistoryNodesError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+	}
+	if isSizeLimitError(err) {
+		return newSizeLimitError(err)
+	}
+	if isServiceError(err) {
+		return err
+	}
+	return serviceerror.NewUnavailablef("failed to append history node: %v", err)
 }
 
 func (s *executionStore) DeleteHistoryNodes(
@@ -2889,12 +3039,12 @@ func (s *executionStore) DeleteHistoryBranch(
 		return serviceerror.NewInvalidArgument("DeleteHistoryBranch missing branch info")
 	}
 
+	// SQL deletes the branch and its nodes in one transaction. A branch can have
+	// far more nodes than a MongoDB transaction should hold, so the nodes go
+	// first and the branch record last: if the delete stops half way, the branch
+	// is still listed and the history scavenger or a retry deletes the rest.
+	// Deleting the branch first would leave nodes that nothing points to.
 	branchInfo := request.BranchInfo
-	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
-	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
-		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
-	}
-
 	for _, br := range request.BranchRanges {
 		rangeFilter := bson.M{
 			"shard_id":  request.ShardID,
@@ -2909,6 +3059,10 @@ func (s *executionStore) DeleteHistoryBranch(
 		}
 	}
 
+	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
+	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
+		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
+	}
 	return nil
 }
 
@@ -3051,9 +3205,88 @@ func (s *executionStore) notImplemented(method string) error {
 	return serviceerror.NewUnimplemented(fmt.Sprintf("MongoDB ExecutionStore: %s not implemented", method))
 }
 
+// shardFenceSeqField is a counter on the shard document that exists only so
+// that the ownership fence is a real write (see fenceShardRangeID).
+const shardFenceSeqField = "fence_seq"
+
+// mongoWriteConflictCode is the server error code for a write conflict.
+const mongoWriteConflictCode = 112
+
+// errHistoryTasksAlreadyPersisted aborts an AddHistoryTasks transaction whose
+// tasks were already written by an earlier attempt.
+var errHistoryTasksAlreadyPersisted = errors.New("history tasks already persisted")
+
+// fenceShardRangeID is the write half of the shard ownership fence and must be
+// the last operation of a transaction that writes on behalf of a shard owner.
+//
+// MongoDB transactions use snapshot isolation and only detect conflicts on
+// documents they write, so reading range_id (assertShardRangeID) cannot stop a
+// stale owner from committing after the range has moved. Writing to the shard
+// document, conditional on range_id, closes that gap: if the range moved
+// before this transaction started the filter does not match, and if it moved
+// while the transaction was open the write conflicts and the transaction is
+// retried, after which the read half reports the ownership loss. This gives the
+// guarantee of the SQL stores (shared lock on the shard row) and of Cassandra
+// (IF range_id = ? in every batch).
+//
+// The update is a $inc rather than a no-op $set because an update that changes
+// nothing does not take part in conflict detection.
+//
+// Concurrency differs from SQL. A shared lock lets transactions of one shard
+// run in parallel; here every transaction writes the shard document, so two
+// transactions of the same shard whose snapshot-to-commit intervals overlap
+// conflict, and the loser is retried (see executeTransaction). The history
+// service must therefore run one persistence operation per shard at a time,
+// which is what history.shardIOConcurrency = 1 does; the shard context
+// enforces that value for MongoDB as it does for Cassandra. Running the write
+// last does not avoid such conflicts. It keeps the shard document locked only
+// until commit, so UpdateShard is not held up for the whole transaction.
+func (s *executionStore) fenceShardRangeID(
+	ctx context.Context,
+	shardID int32,
+	expectedRangeID int64,
+) error {
+	result, err := s.db.Collection(collectionShards).UpdateOne(
+		ctx,
+		bson.M{"_id": shardID, "range_id": expectedRangeID},
+		bson.M{"$inc": bson.M{shardFenceSeqField: int64(1)}},
+	)
+	if err != nil {
+		if isTransientWriteConflict(err) {
+			// Returned unwrapped so that WithTransaction retries the whole
+			// transaction on a fresh snapshot.
+			return err
+		}
+		return serviceerror.NewUnavailablef("failed to fence shard %d: %v", shardID, err)
+	}
+	if result.MatchedCount == 0 {
+		return &persistence.ShardOwnershipLostError{
+			ShardID: shardID,
+			Msg: fmt.Sprintf(
+				"Shard ownership lost. Expected RangeID: %v, shard range has changed",
+				expectedRangeID,
+			),
+		}
+	}
+	return nil
+}
+
+// isTransientWriteConflict reports whether err is a write conflict that the
+// driver may resolve by retrying the transaction.
+func isTransientWriteConflict(err error) bool {
+	var serverErr mongo.ServerError
+	if !errors.As(err, &serverErr) {
+		return false
+	}
+	return serverErr.HasErrorCode(mongoWriteConflictCode) &&
+		serverErr.HasErrorLabel("TransientTransactionError")
+}
+
 // assertShardRangeID verifies that the shard's range_id matches the expected value.
-// This provides write fencing to prevent stale shard owners from writing.
-// Must be called within a transaction context for atomicity.
+// It is the read half of the ownership fence: it fails fast and gives ownership
+// loss precedence over other errors, but on its own it does not prevent a stale
+// owner from committing. Every caller must also run fenceShardRangeID as the
+// last operation of the same transaction.
 func (s *executionStore) assertShardRangeID(
 	ctx context.Context,
 	shardID int32,

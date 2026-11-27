@@ -2083,9 +2083,13 @@ func newContext(
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 
 	ioConcurrency := historyConfig.ShardIOConcurrency()
-	if ioConcurrency != 1 && persistenceConfig.DataStores[persistenceConfig.DefaultStore].Cassandra != nil {
+	defaultStore := persistenceConfig.DataStores[persistenceConfig.DefaultStore]
+	// MongoDB: every execution transaction writes the shard document as its
+	// ownership fence, so concurrent transactions of one shard would conflict
+	// with each other and be retried.
+	if ioConcurrency != 1 && (defaultStore.Cassandra != nil || defaultStore.MongoDB != nil) {
 		throttledLogger.Warn(
-			fmt.Sprintf("Cassandra persistence implementation only supports %v == 1", dynamicconfig.ShardIOConcurrency),
+			fmt.Sprintf("Cassandra and MongoDB persistence implementations only support %v == 1", dynamicconfig.ShardIOConcurrency),
 			tag.NewInt("shard-io-concurrency", ioConcurrency),
 		)
 		ioConcurrency = 1
