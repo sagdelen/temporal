@@ -244,11 +244,17 @@ func buildCLI() *cli.App {
 					if err != nil {
 						return cli.Exit(fmt.Sprintf("Unable to create metrics handler for visibility factory: %v", err), 1)
 					}
-					metricsHandler = metricsHandler.WithTags(metrics.ServiceNameTag(primitives.ServerService))
-					mongoFactory, err := mongodb.NewFactory(*visStoreCfg.MongoDB, cfg.ClusterMetadata.CurrentClusterName, logger, metricsHandler)
+					// The server gets the untagged handler, as it would build it
+					// itself, and each service adds its own service_name tag.
+					// Only the visibility factory's own metrics carry "server".
+					factoryMetricsHandler := metricsHandler.WithTags(metrics.ServiceNameTag(primitives.ServerService))
+					mongoFactory, err := mongodb.NewFactory(*visStoreCfg.MongoDB, cfg.ClusterMetadata.CurrentClusterName, logger, factoryMetricsHandler)
 					if err != nil {
 						return cli.Exit(fmt.Sprintf("Unable to create Mongo visibility factory: %v", err), 1)
 					}
+					// Start blocks until the server stops; close the factory's
+					// client after that.
+					defer mongoFactory.Close()
 					customVisibilityFactory = mongoFactory
 				}
 
