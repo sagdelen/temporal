@@ -9,11 +9,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb"
+	"go.temporal.io/server/common/primitives"
 )
 
 type TaskStoreSuite struct {
@@ -532,4 +535,251 @@ func (s *TaskStoreSuite) TestFairTaskQueues() {
 	})
 	s.Require().NoError(err)
 	s.Require().Positive(count)
+}
+
+// A classic and a fair store share the task_queues collection; each lists only
+// its own queues.
+func (s *TaskStoreSuite) TestListTaskQueueSeparatesClassicAndFair() {
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+
+	classicData := []byte("classic-" + primitives.NewUUID().String())
+	fairData := []byte("fair-" + primitives.NewUUID().String())
+	for _, tc := range []struct {
+		store persistence.TaskStore
+		data  []byte
+	}{{s.store, classicData}, {fairStore, fairData}} {
+		err := tc.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+			NamespaceID:   "ns-list-sep",
+			TaskQueue:     "queue-list-sep",
+			TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			RangeID:       1,
+			TaskQueueInfo: persistence.NewDataBlob(tc.data, enumspb.ENCODING_TYPE_PROTO3.String()),
+		})
+		s.Require().NoError(err)
+	}
+
+	listAll := func(store persistence.TaskStore) [][]byte {
+		var all [][]byte
+		var token []byte
+		for {
+			resp, err := store.ListTaskQueue(s.ctx, &persistence.ListTaskQueueRequest{PageSize: 2, PageToken: token})
+			s.Require().NoError(err)
+			for _, item := range resp.Items {
+				all = append(all, item.TaskQueue.Data)
+			}
+			if len(resp.NextPageToken) == 0 {
+				return all
+			}
+			token = resp.NextPageToken
+		}
+	}
+
+	classic := listAll(s.store)
+	s.Require().Contains(classic, classicData)
+	s.Require().NotContains(classic, fairData)
+
+	fair := listAll(fairStore)
+	s.Require().Contains(fair, fairData)
+	s.Require().NotContains(fair, classicData)
+}
+
+// CompleteTasksLessThan deletes at most Limit tasks, lowest IDs first.
+func (s *TaskStoreSuite) TestCompleteTasksLessThanHonoursLimit() {
+	const (
+		ns    = "ns-complete-limit"
+		queue = "queue-complete-limit"
+	)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+		NamespaceID:   ns,
+		TaskQueue:     queue,
+		TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		RangeID:       1,
+		TaskQueueInfo: info,
+	}))
+
+	var tasks []*persistence.InternalCreateTask
+	for id := int64(1); id <= 5; id++ {
+		tasks = append(tasks, &persistence.InternalCreateTask{
+			TaskId:   id,
+			Task:     persistence.NewDataBlob([]byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()),
+			Subqueue: persistence.SubqueueZero,
+		})
+	}
+	_, err := s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID:   ns,
+		TaskQueue:     queue,
+		TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		RangeID:       1,
+		TaskQueueInfo: info,
+		Tasks:         tasks,
+	})
+	s.Require().NoError(err)
+
+	count, err := s.store.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID:        ns,
+		TaskQueueName:      queue,
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: 100,
+		Subqueue:           persistence.SubqueueZero,
+		Limit:              2,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(2, count)
+
+	resp, err := s.store.GetTasks(s.ctx, &persistence.GetTasksRequest{
+		NamespaceID:        ns,
+		TaskQueue:          queue,
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: 100,
+		Subqueue:           persistence.SubqueueZero,
+		PageSize:           10,
+		UseLimit:           true,
+	})
+	s.Require().NoError(err)
+	s.Require().Len(resp.Tasks, 3)
+}
+
+// Adding a build ID that is already mapped must not abort the user data
+// transaction.
+func (s *TaskStoreSuite) TestBuildIDAddedAgain() {
+	const (
+		ns      = "ns-build-again"
+		queue   = "queue-build-again"
+		buildID = "build-again"
+	)
+	data := persistence.NewDataBlob([]byte("data"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.UpdateTaskQueueUserData(s.ctx, &persistence.InternalUpdateTaskQueueUserDataRequest{
+		NamespaceID: ns,
+		Updates: map[string]*persistence.InternalSingleTaskQueueUserDataUpdate{
+			queue: {Version: 0, UserData: data, BuildIdsAdded: []string{buildID}},
+		},
+	}))
+	s.Require().NoError(s.store.UpdateTaskQueueUserData(s.ctx, &persistence.InternalUpdateTaskQueueUserDataRequest{
+		NamespaceID: ns,
+		Updates: map[string]*persistence.InternalSingleTaskQueueUserDataUpdate{
+			queue: {Version: 1, UserData: data, BuildIdsAdded: []string{buildID}},
+		},
+	}))
+
+	resp, err := s.store.GetTaskQueueUserData(s.ctx, &persistence.GetTaskQueueUserDataRequest{NamespaceID: ns, TaskQueue: queue})
+	s.Require().NoError(err)
+	s.Require().Equal(int64(2), resp.Version)
+
+	count, err := s.store.CountTaskQueuesByBuildId(s.ctx, &persistence.CountTaskQueuesByBuildIdRequest{NamespaceID: ns, BuildID: buildID})
+	s.Require().NoError(err)
+	s.Require().Equal(1, count)
+}
+
+// Classic and fair tasks of a queue share the tasks collection. A fair
+// delete must not remove classic (pass 0) tasks, and a classic delete must
+// not remove fair ones.
+func (s *TaskStoreSuite) TestFairAndClassicTasksDoNotDeleteEachOther() {
+	const (
+		ns    = "ns-fair-classic-mixed"
+		queue = "queue-fair-classic-mixed"
+	)
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	blob := func(v string) *commonpb.DataBlob {
+		return persistence.NewDataBlob([]byte(v), enumspb.ENCODING_TYPE_PROTO3.String())
+	}
+	for _, store := range []persistence.TaskStore{s.store, fairStore} {
+		s.Require().NoError(store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, TaskQueueInfo: info,
+		}))
+	}
+
+	var classicTasks []*persistence.InternalCreateTask
+	for id := int64(1); id <= 3; id++ {
+		classicTasks = append(classicTasks, &persistence.InternalCreateTask{TaskId: id, Task: blob("classic"), Subqueue: persistence.SubqueueZero})
+	}
+	_, err = s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, TaskQueueInfo: info, Tasks: classicTasks,
+	})
+	s.Require().NoError(err)
+	_, err = fairStore.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, TaskQueueInfo: info,
+		Tasks: []*persistence.InternalCreateTask{
+			{TaskPass: 1, TaskId: 10, Task: blob("fair"), Subqueue: persistence.SubqueueZero},
+			{TaskPass: 1, TaskId: 11, Task: blob("fair"), Subqueue: persistence.SubqueueZero},
+		},
+	})
+	s.Require().NoError(err)
+
+	countClassic := func() int {
+		resp, err := s.store.GetTasks(s.ctx, &persistence.GetTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 100, UseLimit: true,
+		})
+		s.Require().NoError(err)
+		return len(resp.Tasks)
+	}
+	fairTasks := func() []*commonpb.DataBlob {
+		resp, err := fairStore.GetTasks(s.ctx, &persistence.GetTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, InclusiveMinPass: 1,
+			ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 100, UseLimit: true,
+		})
+		s.Require().NoError(err)
+		return resp.Tasks
+	}
+	fairComplete := func(limit int) int {
+		n, err := fairStore.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+			NamespaceID: ns, TaskQueueName: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Subqueue: persistence.SubqueueZero,
+			ExclusiveMaxPass: 2, ExclusiveMaxTaskID: math.MaxInt64, Limit: limit,
+		})
+		s.Require().NoError(err)
+		return n
+	}
+
+	// A fair read returns only fair tasks.
+	s.Require().Len(fairTasks(), 2)
+	for _, task := range fairTasks() {
+		s.Require().Equal("fair", string(task.Data))
+	}
+
+	// With a limit, the lowest (pass, id) goes first: a pass-0 task would be
+	// picked before any fair task if the filter had no lower bound.
+	s.Require().Equal(1, fairComplete(1))
+	s.Require().Equal(3, countClassic())
+	s.Require().Len(fairTasks(), 1)
+
+	// A classic delete leaves the fair task.
+	n, err := s.store.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID: ns, TaskQueueName: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Subqueue: persistence.SubqueueZero,
+		ExclusiveMaxTaskID: math.MaxInt64,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(3, n)
+	s.Require().Len(fairTasks(), 1)
+
+	// Without a limit as well.
+	_, err = s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, TaskQueueInfo: info, Tasks: classicTasks,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(1, fairComplete(0))
+	s.Require().Equal(3, countClassic())
+	s.Require().Empty(fairTasks())
+}
+
+// A fair store rejects requests for pass 0, like sql/task_v2.go.
+func (s *TaskStoreSuite) TestFairStoreRejectsPassZero() {
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+
+	_, err = fairStore.GetTasks(s.ctx, &persistence.GetTasksRequest{
+		NamespaceID: "ns-fair-pass0", TaskQueue: "queue-fair-pass0", TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 10,
+	})
+	var internal *serviceerror.Internal
+	s.Require().ErrorAs(err, &internal)
+
+	_, err = fairStore.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID: "ns-fair-pass0", TaskQueueName: "queue-fair-pass0", TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		Subqueue: persistence.SubqueueZero, ExclusiveMaxTaskID: math.MaxInt64,
+	})
+	s.Require().ErrorAs(err, &internal)
 }

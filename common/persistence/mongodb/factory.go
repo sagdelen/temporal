@@ -214,6 +214,7 @@ func (f *Factory) NewTaskStore() (p.TaskStore, error) {
 		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
@@ -238,6 +239,7 @@ func (f *Factory) NewFairTaskStore() (p.TaskStore, error) {
 		f.client,
 		f.cfg,
 		f.logger,
+		f.metricsHandler,
 		f.transactionsEnabled,
 	)
 	if err != nil {
