@@ -999,3 +999,21 @@ func (m *indexMigrator) releaseLease(id string) {
 		bson.M{"$set": bson.M{"lease_until": m.now().Add(-time.Second)}},
 	)
 }
+
+// RunIndexMigrations runs the index migrations synchronously and returns an
+// error unless every index is in place afterwards. Servers do not call this:
+// they run the migrations in the background (startIndexMigration). It is for
+// tools and test fixtures that want every index in place before the database
+// is used, and it expects the primary and the visibility collections in the
+// database of this factory.
+func (f *Factory) RunIndexMigrations(ctx context.Context) error {
+	for _, migration := range []indexMigration{primaryIndexMigration(), visibilityIndexMigration()} {
+		outcome := newIndexMigrator(f.database, f.logger).run(ctx, migration)
+		switch outcome {
+		case indexMigrationCompleted, indexMigrationAlreadyCompleted:
+		default:
+			return fmt.Errorf("mongodb index migration %s did not complete: %s", migration.ID, outcome)
+		}
+	}
+	return nil
+}
