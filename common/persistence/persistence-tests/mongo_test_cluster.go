@@ -77,12 +77,6 @@ func NewTestBaseWithMongoDB(opts *TestBaseOptions) *TestBase {
 	if cfgCopy.ReplicaSet == "" {
 		cfgCopy.ReplicaSet = environment.GetMongoDBReplicaSet()
 	}
-	if cfgCopy.ReadPreference == "" {
-		cfgCopy.ReadPreference = "primary"
-	}
-	if cfgCopy.WriteConcern == "" {
-		cfgCopy.WriteConcern = "majority"
-	}
 	if opts.Logger == nil {
 		opts.Logger = log.NewTestLogger()
 	}
@@ -103,8 +97,6 @@ func GetMongoDBTestClusterOption() *TestBaseOptions {
 		MinConns:       20,
 		ConnectTimeout: 10 * time.Second,
 		ReplicaSet:     environment.GetMongoDBReplicaSet(),
-		ReadPreference: "primary",
-		WriteConcern:   "majority",
 	}
 	return &TestBaseOptions{
 		StoreType:         config.StoreTypeNoSQL,

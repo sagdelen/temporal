@@ -465,11 +465,12 @@ type (
 		TLS *auth.TLS `yaml:"tls"`
 		// ReplicaSet is the name of the replica set (enables transactions)
 		ReplicaSet string `yaml:"replicaSet"`
-		// ReadPreference defines how reads are distributed across replica set members
-		// Options: primary, primaryPreferred, secondary, secondaryPreferred, nearest
+		// ReadPreference is not applied; a warning is logged when it is set.
+		// Temporal reads always go to the primary.
 		ReadPreference string `yaml:"readPreference"`
-		// WriteConcern defines the level of acknowledgment requested from MongoDB
-		// Options: majority, w1, w2, w3, etc.
+		// WriteConcern is not applied; a warning is logged when it is set.
+		// Writes use the write concern of the MongoDB deployment, which an
+		// operator sets with setDefaultRWConcern.
 		WriteConcern string `yaml:"writeConcern"`
 	}
 

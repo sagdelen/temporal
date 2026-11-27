@@ -54,7 +54,5 @@ func newMongoTestConfig(databaseName string) config.MongoDB {
 		DatabaseName:   databaseName,
 		ConnectTimeout: 10 * time.Second,
 		MaxConns:       10,
-		ReadPreference: "primary",
-		WriteConcern:   "majority",
 	}
 }

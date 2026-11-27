@@ -3,11 +3,9 @@ package mongodb
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
@@ -76,17 +74,11 @@ func (f *Factory) initialize() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Build connection string
-	uri := f.buildConnectionString()
-
-	// Create client options
-	clientOpts := options.Client().
-		ApplyURI(uri).
-		SetConnectTimeout(f.cfg.ConnectTimeout).
-		SetServerSelectionTimeout(f.cfg.ConnectTimeout).
-		SetHeartbeatInterval(10 * time.Second).
-		SetRetryReads(true).
-		SetRetryWrites(true)
+	clientOpts := buildClientOptions(f.cfg)
+	for name, value := range ignoredConsistencySettings(f.cfg) {
+		f.logger.Warn("MongoDB "+name+" in the persistence config is ignored: reads always use the primary and writes use the write concern of the MongoDB deployment (setDefaultRWConcern)",
+			tag.NewStringTag(name, value))
+	}
 
 	if f.cfg.MaxConns > 0 {
 		clientOpts.SetMaxPoolSize(uint64(f.cfg.MaxConns))
@@ -119,7 +111,7 @@ func (f *Factory) initialize() error {
 	}
 
 	// Create client
-	mongoClient, err := client.NewClient(ctx, uri, clientOpts)
+	mongoClient, err := client.NewClientFromOptions(ctx, clientOpts, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create MongoDB client: %w", err)
 	}
@@ -154,38 +146,6 @@ func (f *Factory) initialize() error {
 	)
 
 	return nil
-}
-
-// buildConnectionString constructs MongoDB connection URI
-func (f *Factory) buildConnectionString() string {
-	uri := "mongodb://"
-
-	// Add credentials if provided
-	if f.cfg.User != "" && f.cfg.Password != "" {
-		uri += fmt.Sprintf("%s:%s@", f.cfg.User, f.cfg.Password)
-	}
-
-	// Add hosts
-	uri += strings.Join(f.cfg.Hosts, ",")
-
-	// Add database name
-	uri += "/" + f.cfg.DatabaseName
-
-	// Add options
-	var opts []string
-
-	if f.cfg.ReplicaSet != "" {
-		opts = append(opts, fmt.Sprintf("replicaSet=%s", f.cfg.ReplicaSet))
-	}
-	if f.cfg.AuthSource != "" {
-		opts = append(opts, fmt.Sprintf("authSource=%s", f.cfg.AuthSource))
-	}
-
-	if len(opts) > 0 {
-		uri += "?" + strings.Join(opts, "&")
-	}
-
-	return uri
 }
 
 // Close closes the factory and underlying connections

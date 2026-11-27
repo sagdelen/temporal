@@ -160,14 +160,21 @@ replicaSet: rs0
 maxPoolSize: 100
 minPoolSize: 10
 
-# Write concern for durability
-writeConcern:
-  w: majority
-  j: true
-
-# Read preference
-readPreference: primaryPreferred
 ```
+
+**Read preference and write concern are not set by Temporal.** `readPreference`
+and `writeConcern` in the datastore config are ignored, and a warning is logged
+if they are set:
+
+- Reads always go to the primary. Temporal must read its own writes; reads from
+  a lagging secondary could miss history or matching tasks.
+- Writes and transactions use the write concern of the MongoDB deployment. Set
+  it once on the cluster, for example
+  `db.adminCommand({setDefaultRWConcern: 1, defaultWriteConcern: {w: "majority"}})`.
+  `majority` is recommended on a replica set with three data-bearing members.
+  On a replica set with an arbiter (PSA) MongoDB defaults to `w:1`, because
+  `majority` there stops writes while a data-bearing member is down; choose
+  between availability and durability deliberately.
 
 ### Resource Requirements
 
