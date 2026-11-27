@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -269,11 +271,9 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 		return err
 	}
 
-	removedTransient, err := s.stripTransientSearchAttributes(doc)
-	if err != nil {
+	if _, err := s.stripTransientSearchAttributes(doc); err != nil {
 		return err
 	}
-	shouldUnsetTransient := removedTransient || enumspb.WorkflowExecutionStatus(doc.Status) != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
 
 	closeTime := request.CloseTime.UTC()
 	doc.CloseTime = &closeTime
@@ -291,17 +291,9 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 	stateTransitions := request.StateTransitionCount
 	doc.StateTransitionCount = &stateTransitions
 
-	updateSet, err := visibilityDocumentUpdate(doc)
+	updateOps, err := visibilityDocumentUpdate(doc)
 	if err != nil {
 		return err
-	}
-
-	updateOps := bson.M{
-		"$set":         updateSet,
-		"$setOnInsert": bson.M{"_id": doc.ID},
-	}
-	if shouldUnsetTransient {
-		updateOps["$unset"] = bson.M{sadefs.TemporalPauseInfo: ""}
 	}
 
 	filter := bson.M{"_id": doc.ID}
@@ -328,22 +320,13 @@ func (s *visibilityStore) UpsertWorkflowExecution(ctx context.Context, request *
 
 	doc.VisibilityTime = doc.StartTime
 
-	removedTransient, err := s.stripTransientSearchAttributes(doc)
-	if err != nil {
+	if _, err := s.stripTransientSearchAttributes(doc); err != nil {
 		return err
 	}
 
-	updateSet, err := visibilityDocumentUpdate(doc)
+	updateOps, err := visibilityDocumentUpdate(doc)
 	if err != nil {
 		return err
-	}
-
-	updateOps := bson.M{
-		"$set":         updateSet,
-		"$setOnInsert": bson.M{"_id": doc.ID},
-	}
-	if removedTransient {
-		updateOps["$unset"] = bson.M{sadefs.TemporalPauseInfo: ""}
 	}
 
 	filter := bson.M{
@@ -1039,8 +1022,14 @@ func (s *visibilityStore) convertQueryParams(
 		mapper,
 	).WithChasmMapper(chasmMapper).WithArchetypeID(archetypeID)
 
+	// Query errors are the caller's: report them as InvalidArgument, as the
+	// SQL store does.
 	params, err := converter.Convert(queryString)
 	if err != nil {
+		var converterErr *query.ConverterError
+		if errors.As(err, &converterErr) {
+			return nil, converterErr.ToInvalidArgument()
+		}
 		return nil, err
 	}
 	return params, nil
@@ -1304,18 +1293,57 @@ func mongoAnd(filters ...bson.M) bson.M {
 	return bson.M{"$and": flattened}
 }
 
+// visibilityOptionalFields lists the BSON fields of visibilityExecutionDocument
+// that are left out when empty (omitempty).
+var visibilityOptionalFields = func() []string {
+	var fields []string
+	t := reflect.TypeOf(visibilityExecutionDocument{})
+	for i := 0; i < t.NumField(); i++ {
+		name, opts, _ := strings.Cut(t.Field(i).Tag.Get("bson"), ",")
+		if name == "" || name == "_id" {
+			continue
+		}
+		for _, opt := range strings.Split(opts, ",") {
+			if opt == "omitempty" {
+				fields = append(fields, name)
+				break
+			}
+		}
+	}
+	return fields
+}()
+
+// visibilityDocumentUpdate builds the update that makes a stored record equal
+// to doc, as the SQL stores do by replacing the whole row: fields doc carries
+// are set and optional fields it leaves out are removed. Without the $unset a
+// cleared memo, parent or close time, or search attributes that dropped to
+// none, would keep their old values.
 func visibilityDocumentUpdate(doc *visibilityExecutionDocument) (bson.M, error) {
 	raw, err := bson.Marshal(doc)
 	if err != nil {
 		return nil, serviceerror.NewInternalf("failed to marshal visibility document: %v", err)
 	}
 
-	var m bson.M
-	if err := bson.Unmarshal(raw, &m); err != nil {
+	var set bson.M
+	if err := bson.Unmarshal(raw, &set); err != nil {
 		return nil, serviceerror.NewInternalf("failed to unmarshal visibility document: %v", err)
 	}
-	delete(m, "_id")
-	return m, nil
+	delete(set, "_id")
+
+	update := bson.M{
+		"$set":         set,
+		"$setOnInsert": bson.M{"_id": doc.ID},
+	}
+	unset := bson.M{}
+	for _, field := range visibilityOptionalFields {
+		if _, ok := set[field]; !ok {
+			unset[field] = ""
+		}
+	}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	return update, nil
 }
 
 func documentToExecutionInfo(doc *visibilityExecutionDocument, saTypeMap searchattribute.NameTypeMap) (*store.InternalExecutionInfo, error) {

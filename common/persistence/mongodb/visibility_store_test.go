@@ -739,3 +739,48 @@ func (c *fakeVisibilityCursor) Close(context.Context) error {
 func (c *fakeVisibilityCursor) Err() error {
 	return nil
 }
+
+func TestVisibilityDocumentUpdate_UnsetsFieldsTheRecordNoLongerHas(t *testing.T) {
+	doc := &visibilityExecutionDocument{
+		ID:          visibilityDocID("ns", "wf", "run"),
+		NamespaceID: "ns",
+		WorkflowID:  "wf",
+		RunID:       "run",
+		TaskQueue:   "tq",
+		Memo:        []byte("memo"),
+	}
+	update, err := visibilityDocumentUpdate(doc)
+	require.NoError(t, err)
+
+	set := update["$set"].(bson.M)
+	require.Equal(t, "tq", set["task_queue"])
+	require.NotContains(t, set, "_id")
+	require.Equal(t, bson.M{"_id": doc.ID}, update["$setOnInsert"])
+
+	unset := update["$unset"].(bson.M)
+	for _, field := range []string{
+		"close_time", "execution_duration", "history_length", "history_size_bytes",
+		"state_transition_count", "search_attributes_data", "search_attributes_encoding",
+		"parent_workflow_id", "parent_run_id",
+	} {
+		require.Contains(t, unset, field)
+	}
+	require.NotContains(t, unset, "task_queue")
+	require.NotContains(t, unset, "memo")
+	// No field may be both set and unset: MongoDB rejects such an update.
+	for field := range unset {
+		require.NotContains(t, set, field)
+	}
+}
+
+func TestVisibilityStoreListWorkflowExecutions_BadQueryIsInvalidArgument(t *testing.T) {
+	store := buildVisibilityStore(t)
+
+	_, err := store.ListWorkflowExecutions(context.Background(), &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: namespace.ID("ns"),
+		Namespace:   namespace.Name("ns"),
+		Query:       "NoSuchAttribute = 'x'",
+	})
+	var invalidArg *serviceerror.InvalidArgument
+	require.ErrorAs(t, err, &invalidArg)
+}
